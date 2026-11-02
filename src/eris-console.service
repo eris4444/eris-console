@@ -1,0 +1,13 @@
+[Unit]
+Description=ERIS Console look on the physical console (font after KMS takeover, neon palette, blanking)
+After=console-setup.service systemd-sysctl.service systemd-udevd.service
+ConditionPathExists=/dev/tty1
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/eris apply --boot
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target
