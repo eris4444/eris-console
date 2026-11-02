@@ -1,0 +1,20 @@
+[Unit]
+Description=ERIS dashboard in the top part of the physical console (eris on / eris off)
+After=eris-console.service getty@tty1.service systemd-user-sessions.service
+ConditionPathExists=/dev/tty1
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/python3 /usr/local/lib/eris/erisd.py
+ExecStopPost=/usr/local/bin/eris reset-tty --if-dirty
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=40
+TimeoutStopSec=8
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target
