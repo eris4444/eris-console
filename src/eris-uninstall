@@ -1,0 +1,83 @@
+#!/bin/bash
+# eris-uninstall: remove ERIS Console completely and put back what it changed.
+# Backups made by the installer stay in /var/backups/eris.
+set -u
+[ "$(id -u)" -eq 0 ] || { echo "eris-uninstall: run as root" >&2; exit 1; }
+LOG=/var/log/eris-build.log
+ST=/var/lib/eris
+say() { printf '[ERIS] %s\n' "$*"; printf '%s [uninstall] %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
+
+TTY=/dev/tty1
+if [ -r /etc/eris/eris.conf ]; then
+  t=$(sed -n 's/^CONSOLE_TTY="\(.*\)"$/\1/p' /etc/eris/eris.conf | tail -n 1)
+  [ -n "$t" ] && TTY=$t
+fi
+
+# 1. services first: the dashboard hands the screen back when it stops
+for u in eris-dashboard.service eris-console.service; do
+  if systemctl cat "$u" > /dev/null 2>&1; then
+    timeout 30 systemctl disable --now "$u" > /dev/null 2>&1
+    say "stopped and disabled $u"
+  fi
+done
+
+# 2. kernel default palette, console blanking, scroll region / origin mode
+if [ -r "$ST/vt-default.orig" ]; then
+  while IFS='=' read -r k v; do
+    [ -w "/sys/module/vt/parameters/default_$k" ] && printf '%s' "$v" > "/sys/module/vt/parameters/default_$k"
+  done < "$ST/vt-default.orig"
+  say "kernel default palette restored"
+fi
+blank=0
+[ -r "$ST/consoleblank.orig" ] && blank=$(( $(cat "$ST/consoleblank.orig") / 60 ))
+if [ -c "$TTY" ]; then
+  printf '\033]R\0337\033[r\033[?6l\0338\033[0m\033[9;%d]\033[14;%d]' "$blank" "$blank" > "$TTY"
+  say "$TTY reset: palette, scroll region (ESC[r), origin mode (ESC[?6l), blanking ${blank} min"
+fi
+
+# 3. console-setup and the console font
+if [ -r "$ST/console-setup.orig" ] && ! cmp -s "$ST/console-setup.orig" /etc/default/console-setup; then
+  cp "$ST/console-setup.orig" /etc/default/console-setup
+  timeout 90 setupcon --save-only > /dev/null 2>&1
+  say "/etc/default/console-setup restored (setupcon --save-only)"
+fi
+if [ -r "$ST/cached-created" ]; then
+  while read -r f; do
+    case $f in /etc/console-setup/cached_*) [ -e "$f" ] && rm -f "$f" && say "removed $f (made by ERIS)" ;; esac
+  done < "$ST/cached-created"
+fi
+font=$(sed -n "s/^setfont '\{0,1\}\(\/[^' ]*\.psfu\{0,1\}\(\.gz\)\{0,1\}\).*/\1/p" /etc/console-setup/cached_setup_font.sh 2> /dev/null | head -n 1)
+[ -n "$font" ] || font=$(cat "$ST/system-font.orig" 2> /dev/null)
+if [ -n "$font" ] && [ -c "$TTY" ] && timeout 20 setfont -C "$TTY" "$font"; then
+  say "console font: $font"
+fi
+
+# 4. kernel messages back on the console
+if [ -e /etc/sysctl.d/90-eris-console.conf ]; then
+  rm -f /etc/sysctl.d/90-eris-console.conf
+  p="4 4 1 7"
+  [ -r "$ST/printk.orig" ] && p=$(cat "$ST/printk.orig")
+  printf '%s' "$p" > /proc/sys/kernel/printk
+  say "removed /etc/sysctl.d/90-eris-console.conf, kernel.printk = $p"
+fi
+
+# 5. only the ERIS blocks in the shell files
+for f in /root/.bashrc /root/.profile; do
+  if [ -f "$f" ] && grep -q '^# >>> ERIS CONSOLE' "$f"; then
+    sed -i '/^# >>> ERIS CONSOLE/,/^# <<< ERIS CONSOLE/d' "$f"
+    say "removed the ERIS block from $f"
+  fi
+done
+
+# 6. files
+for f in /etc/systemd/system/eris-dashboard.service /etc/systemd/system/eris-console.service \
+         /usr/local/bin/eris /usr/local/lib/eris /etc/eris /run/eris "$ST"; do
+  if [ -e "$f" ]; then
+    rm -rf "$f"
+    say "removed $f"
+  fi
+done
+systemctl daemon-reload
+rm -f /usr/local/sbin/eris-uninstall
+say "removed /usr/local/sbin/eris-uninstall"
+say "ERIS Console is gone. Open a new shell (or: exec bash -l) to drop the prompt in this one."
