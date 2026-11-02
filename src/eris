@@ -1,0 +1,745 @@
+#!/usr/bin/python3
+"""eris - control the ERIS Console.
+
+  eris                      settings menu
+  eris on | off | toggle    start / stop the dashboard now
+  eris enable | disable     dashboard at boot (and start / stop it now)
+  eris status               what is running and how the console is set up
+  eris set KEY VALUE        change a setting (eris config lists them)
+  eris get KEY | config
+  eris font [list | set NAME|default | current]
+  eris apply                re-apply the console look (font, palette, blanking, kernel messages)
+  eris render [ROWSxCOLS] [utf8|safe|ascii]   print one dashboard frame here
+  eris selftest             quick checks of the installed files
+  eris version
+"""
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, "/usr/local/lib/eris")
+import erislib as E  # noqa: E402
+
+UNIT = "eris-dashboard.service"
+LOOK_UNIT = "eris-console.service"
+DAEMON = "/usr/local/lib/eris/erisd.py"
+TTYOUT = sys.stdout.isatty()
+
+
+def c(code, s):
+    return "\033[%sm%s\033[0m" % (code, s) if TTYOUT else s
+
+
+PINK, PURPLE, BLUE, GREEN, AMBER, RED, CYAN, GREY, WHITE = "1;35", "35", "1;34", "1;32", "33", "1;31", "1;36", "1;30", "1;37"
+
+
+def sh(*cmd, timeout=60):
+    try:
+        return subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", "timeout")
+
+
+def need_root():
+    if os.geteuid() != 0:
+        sys.exit("eris: run as root")
+
+
+def svc_state(unit=UNIT):
+    return sh("systemctl", "is-active", unit).stdout.strip() or "unknown"
+
+
+def svc_enabled(unit=UNIT):
+    return sh("systemctl", "is-enabled", unit).stdout.strip() or "unknown"
+
+
+# ---------------------------------------------------------------- dashboard service
+
+def cmd_on():
+    need_root()
+    if svc_state() == "active":
+        print("ERIS dashboard: already %s" % c(GREEN, "ON"))
+        return 0
+    r = sh("systemctl", "start", UNIT, timeout=60)
+    if svc_state() == "active":
+        print("ERIS dashboard: %s  (eris off to hide it)" % c(GREEN, "ON"))
+        return 0
+    print("ERIS dashboard: %s %s" % (c(RED, "failed to start"), r.stderr.strip()))
+    print(sh("journalctl", "-u", UNIT, "-n", "8", "--no-pager", "-o", "cat").stdout)
+    return 1
+
+
+def cmd_off():
+    need_root()
+    sh("systemctl", "stop", UNIT, timeout=30)
+    print("ERIS dashboard: %s" % c(GREY, "OFF"))
+    return 0
+
+
+def cmd_toggle():
+    return cmd_off() if svc_state() == "active" else cmd_on()
+
+
+def cmd_enable():
+    need_root()
+    sh("systemctl", "enable", UNIT)
+    E.save_conf({"DASH_AT_BOOT": "yes"})
+    print("ERIS dashboard: starts at boot")
+    return cmd_on()
+
+
+def cmd_disable():
+    need_root()
+    sh("systemctl", "disable", UNIT)
+    E.save_conf({"DASH_AT_BOOT": "no"})
+    print("ERIS dashboard: not started at boot")
+    return cmd_off()
+
+
+def daemon_info():
+    r = sh("systemctl", "show", UNIT, "-p", "MainPID", "--value")
+    pid = r.stdout.strip()
+    if not pid or pid == "0":
+        return None
+    p = sh("ps", "-o", "pid=,pcpu=,rss=,etime=", "-p", pid).stdout.split()
+    return {"pid": pid, "cpu": p[1], "rss_kb": p[2], "etime": p[3]} if len(p) == 4 else {"pid": pid}
+
+
+def cmd_status():
+    conf = E.load_conf()
+    tty = conf["CONSOLE_TTY"]
+    st, en = svc_state(), svc_enabled()
+    on = st == "active"
+    print(c(PINK, "ERIS") + " Console %s" % E.VERSION)
+    line = "%s  (%s at boot)" % (c(GREEN, "ON") if on else c(GREY, "OFF"), "started" if en == "enabled" else "not started")
+    di = daemon_info() if on else None
+    if di and "cpu" in di:
+        line += "  pid %s, %s%% CPU, %d MB RSS, up %s" % (di["pid"], di["cpu"], int(di["rss_kb"]) // 1024, di["etime"])
+    print("  dashboard : " + line)
+    try:
+        fd = E.open_tty(tty, write=False)
+        rows, cols, _, _ = E.console_geometry(fd, tty)
+        os.close(fd)
+        w, h, n = E.font_info(tty)
+        cs = E.choose_charset(conf, tty)
+        print("  console   : %s %dx%d, font %dx%d (%d glyphs), charset %s" % (tty, cols, rows, w, h, n, cs))
+        if on:
+            sf = os.path.join(E.RUN_DIR, "dashboard-tty%d.state" % E.tty_index(tty))
+            hh = re.search(r"H=(\d+)", open(sf).read()) if os.path.exists(sf) else None
+            print("  split     : top %s rows dashboard, %s rows shell" % (hh.group(1) if hh else "?",
+                                                                         rows - int(hh.group(1)) if hh else "?"))
+    except OSError as e:
+        print("  console   : %s not available (%s)" % (tty, e))
+    pk = " ".join(E.printk())
+    try:
+        blank = int(open("/sys/module/kernel/parameters/consoleblank").read())
+    except (OSError, ValueError):
+        blank = None
+    print("  look      : palette %s, blanking %s, kernel messages %s (printk %s), font %s" % (
+        conf["PALETTE"], "never" if not blank else "%d min" % (blank // 60), conf["KERNEL_MSGS"], pk,
+        conf["CONSOLE_FONT"] or "system (console-setup)"))
+    print("  prompt    : scope %s" % conf["PROMPT_SCOPE"])
+    print("  settings  : %s   (eris = menu, eris config = list)" % E.CONF)
+    print("  look unit : %s %s" % (LOOK_UNIT, svc_state(LOOK_UNIT)))
+    return 0
+
+
+# ---------------------------------------------------------------- console look (layer A)
+
+def ensure_originals():
+    """Remember what the system looked like before ERIS touched it (for eris-uninstall)."""
+    os.makedirs(E.STATE_DIR, exist_ok=True)
+
+    def keep(name, value):
+        p = os.path.join(E.STATE_DIR, name)
+        if not os.path.exists(p) and value is not None:
+            with open(p, "w") as f:
+                f.write(value)
+
+    try:
+        keep("vt-default.orig", "".join("%s=%s\n" % kv for kv in E.read_vt_default().items()))
+    except OSError:
+        pass
+    keep("printk.orig", " ".join(E.printk()))
+    try:
+        keep("consoleblank.orig", open("/sys/module/kernel/parameters/consoleblank").read().strip())
+    except OSError:
+        pass
+    if os.path.exists(E.CONSOLE_SETUP):
+        keep("console-setup.orig", open(E.CONSOLE_SETUP).read())
+    keep("system-font.orig", E.system_font() or "")
+
+
+def font_ok(tty, path):
+    try:
+        w, h, n = E.font_info(tty)
+        fw, fh, fn, _ = E.psf_header(path)
+        return (w, h, n) == (fw, fh, fn) and len(E.tty_unicode_set(tty)) >= 200
+    except (OSError, ValueError):
+        return False
+
+
+def desired_font(conf):
+    if conf["CONSOLE_FONT"]:
+        return E.font_path(conf["CONSOLE_FONT"])
+    return E.system_font()
+
+
+def loaded_font(conf):
+    """The file actually put on the console: the ERIS build of the chosen font (with the mascot,
+    icon, sparkline and ➜ glyphs) unless ERIS_GLYPHS=off or it cannot be built."""
+    base = desired_font(conf)
+    if not base or conf.get("ERIS_GLYPHS", "on") != "on":
+        return base
+    try:
+        import erisfont
+        return erisfont.ensure(base, os.path.join(E.STATE_DIR, "fonts"))
+    except (OSError, ValueError) as e:
+        E.log("ERIS font for %s not built: %s" % (base, e))
+        return base
+
+
+def apply_font(conf, force=False):
+    tty = conf["CONSOLE_TTY"]
+    path = loaded_font(conf)
+    if not path:
+        return "no font configured"
+    if force or not font_ok(tty, path):
+        E.set_font(tty, path)
+        return "loaded %s" % os.path.basename(path)
+    return "kept %s" % os.path.basename(path)
+
+
+def apply_palette(conf, redraw=True):
+    tty = conf["CONSOLE_TTY"]
+    if conf["PALETTE"] == "neon":
+        E.write_vt_default(E.neon_vt_default())
+    else:
+        orig = os.path.join(E.STATE_DIR, "vt-default.orig")
+        if os.path.exists(orig):
+            E.write_vt_default(dict(l.strip().split("=", 1) for l in open(orig) if "=" in l))
+    # default colours white on black, then the palette itself
+    E.tty_write(tty, E.palette_seq(conf["PALETTE"]) + "\033[0m")
+    # A 32-bit framebuffer bakes colours into pixels: text already on screen keeps the old palette
+    # until it is drawn again. Loading the same font makes fbcon redraw the whole console.
+    path = loaded_font(conf)
+    if redraw and path:
+        try:
+            E.set_font(tty, path)
+        except (RuntimeError, OSError):
+            pass
+
+
+def apply_console(mode="now", quiet=True):
+    need_root()
+    conf = E.load_conf()
+    tty = conf["CONSOLE_TTY"]
+    if not os.path.exists(tty):
+        return 0
+    if mode == "login":
+        try:
+            if os.ttyname(0) != tty or os.environ.get("SSH_CONNECTION"):
+                return 0
+        except OSError:
+            return 0
+    if mode == "boot":
+        deadline = time.time() + 30
+        while not E.fbcon_ready() and time.time() < deadline:
+            time.sleep(0.5)
+    ensure_originals()
+    notes = []
+    try:
+        apply_palette(conf, redraw=False)
+        E.tty_write(tty, E.blank_seq(conf["BLANK_MINUTES"]))
+        notes.append("palette %s, blank %s min" % (conf["PALETTE"], conf["BLANK_MINUTES"]))
+    except OSError as e:
+        notes.append("look: %s" % e)
+    try:
+        # after the palette: (re)loading the font also repaints the console in the new colours
+        notes.append("font: " + apply_font(conf, force=(mode in ("boot", "now"))))
+    except (RuntimeError, OSError) as e:
+        notes.append("font: %s" % e)
+    want = "1" if conf["KERNEL_MSGS"] == "hidden" else None
+    if (want == "1") != (E.printk()[0] == "1") or (want == "1") != os.path.exists(E.SYSCTL_FILE):
+        notes.append("printk " + E.set_kernel_msgs(conf["KERNEL_MSGS"]))
+    try:
+        arrow, err = E.write_prompt_env(tty, conf)
+        notes.append("prompt glyphs %s %s" % (arrow, err))
+    except OSError as e:
+        notes.append("prompt env: %s" % e)
+    E.log("apply %s: %s" % (mode, "; ".join(notes)))
+    if not quiet:
+        for n in notes:
+            print("  " + n)
+    return 0
+
+
+# ---------------------------------------------------------------- fonts
+
+def font_setup_values(name):
+    m = re.match(r"^([A-Za-z0-9]+)-([A-Za-z]+?)(\d+)(?:x(\d+))?$", name)
+    if not m:
+        return None
+    codeset, face, a, b = m.group(1), m.group(2), int(m.group(3)), m.group(4)
+    h, w = (a, int(b)) if b else (a, 8)
+    return {"CODESET": codeset, "FONTFACE": face, "FONTSIZE": "%dx%d" % (w, h)}
+
+
+def backup_file(path):
+    if not os.path.exists(path):
+        return None
+    dest = os.path.join(E.BACKUP_ROOT, time.strftime("%Y%m%d-%H%M%S"), path.lstrip("/"))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copy2(path, dest)
+    return dest
+
+
+def persist_console_setup(name):
+    """Make console-setup load the same font early at boot (ERIS re-applies it after the KMS takeover)."""
+    orig = os.path.join(E.STATE_DIR, "console-setup.orig")
+    bk = backup_file(E.CONSOLE_SETUP)
+    if name is None:
+        if os.path.exists(orig):
+            shutil.copyfile(orig, E.CONSOLE_SETUP)
+    else:
+        vals = font_setup_values(name)
+        if not vals:
+            return "console-setup unchanged (unknown font name pattern)"
+        lines = open(E.CONSOLE_SETUP).read().splitlines() if os.path.exists(E.CONSOLE_SETUP) else []
+        seen = set()
+        for i, line in enumerate(lines):
+            m = re.match(r"^\s*([A-Z_]+)=", line)
+            if m and m.group(1) in vals:
+                lines[i] = '%s="%s"' % (m.group(1), vals[m.group(1)])
+                seen.add(m.group(1))
+            elif m and m.group(1) == "FONT":
+                lines[i] = "# " + line + "   # disabled by ERIS (CODESET/FONTFACE/FONTSIZE are used)"
+        for k, v in vals.items():
+            if k not in seen:
+                lines.append('%s="%s"' % (k, v))
+        with open(E.CONSOLE_SETUP + ".tmp", "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(E.CONSOLE_SETUP + ".tmp", E.CONSOLE_SETUP)
+    before = set(glob.glob("/etc/console-setup/cached_*.psf*"))
+    r = sh("setupcon", "--save-only", timeout=90)
+    track = os.path.join(E.STATE_DIR, "cached-created")
+    created = set(open(track).read().split()) if os.path.exists(track) else set()
+    created |= set(glob.glob("/etc/console-setup/cached_*.psf*")) - before
+    loaded = E.system_font()
+    ok = r.returncode == 0 and (name is None or (loaded and os.path.basename(loaded).startswith(name + ".")))
+    if not ok and bk:
+        shutil.copyfile(bk, E.CONSOLE_SETUP)
+        sh("setupcon", "--save-only", timeout=90)
+    # cached font copies that only ERIS made and nothing loads any more
+    keep = {"/etc/console-setup/cached_%s" % os.path.basename(E.system_font() or "")}
+    for f in sorted(created - keep):
+        try:
+            os.unlink(f)
+        except FileNotFoundError:
+            pass
+    created &= keep
+    with open(track, "w") as fh:
+        fh.write("\n".join(sorted(created)) + "\n")
+    if not ok:
+        return "console-setup could not use %s (restored; ERIS still applies the font at boot): %s" % (name, r.stderr.strip()[:120])
+    return "console-setup updated (backup %s)" % bk if bk else "console-setup updated"
+
+
+def set_console_font(name):
+    need_root()
+    conf = E.load_conf()
+    tty = conf["CONSOLE_TTY"]
+    if name in ("default", "system", ""):
+        E.save_conf({"CONSOLE_FONT": ""})
+        msg = persist_console_setup(None)
+    else:
+        if not E.font_path(name):
+            raise ValueError("font %s not found in %s" % (name, E.FONT_DIR))
+        E.save_conf({"CONSOLE_FONT": name})
+        msg = persist_console_setup(name)
+    path = loaded_font(E.load_conf())
+    if path:
+        E.set_font(tty, path)
+    E.write_prompt_env(tty, E.load_conf())
+    fd = E.open_tty(tty, write=False)
+    rows, cols, _, _ = E.console_geometry(fd, tty)
+    os.close(fd)
+    w, h, n = E.font_info(tty)
+    E.log("console font -> %s (%dx%d glyphs, %dx%d console); %s" % (name or "default", w, h, cols, rows, msg))
+    return "font %dx%d -> console %dx%d; %s" % (w, h, cols, rows, msg)
+
+
+def font_table(bold=False):
+    res = E.fb_resolution()
+    rows = []
+    for f in E.terminus_fonts():
+        if (f["face"] != "Terminus") and not bold:
+            continue
+        if bold and f["face"] == "Terminus":
+            continue
+        grid = "%dx%d" % (res[0] // f["w"], res[1] // f["h"]) if res else "?"
+        rows.append((f, grid))
+    return rows
+
+
+def cmd_font(args):
+    sub = args[0] if args else "list"
+    conf = E.load_conf()
+    tty = conf["CONSOLE_TTY"]
+    if sub == "current":
+        w, h, n = E.font_info(tty)
+        print("%s: font %dx%d, %d glyphs; setting CONSOLE_FONT=%s; system font %s" % (
+            tty, w, h, n, conf["CONSOLE_FONT"] or "(system)", E.system_font()))
+        return 0
+    if sub == "list":
+        for bold in (False, True):
+            for f, grid in font_table(bold):
+                print("%-28s %2dx%-3d glyph  -> %s console  (%s)" % (f["name"], f["w"], f["h"], grid, f["charset"]))
+        modes = []
+        for m in sorted(set(E.rd("/sys/class/drm/%s/modes" % d) or "" for d in os.listdir("/sys/class/drm")
+                            if re.fullmatch(r"card\d+-.+", d) and E.rd("/sys/class/drm/%s/status" % d) == "connected")):
+            modes += m.split()
+        res = E.fb_resolution()
+        print("display: %s now; modes offered by the monitor: %s" % ("%dx%d" % res if res else "?",
+                                                                   " ".join(dict.fromkeys(modes)) or "?"))
+        return 0
+    if sub == "set" and len(args) > 1:
+        print(set_console_font(args[1]))
+        return 0
+    print("usage: eris font [list | set NAME|default | current]")
+    return 2
+
+
+# ---------------------------------------------------------------- settings
+
+SIDE_EFFECTS = {
+    "PALETTE": lambda conf: apply_palette(conf),
+    "BLANK_MINUTES": lambda conf: E.tty_write(conf["CONSOLE_TTY"], E.blank_seq(conf["BLANK_MINUTES"])),
+    "KERNEL_MSGS": lambda conf: E.set_kernel_msgs(conf["KERNEL_MSGS"]),
+    "DASH_AT_BOOT": lambda conf: sh("systemctl", "enable" if conf["DASH_AT_BOOT"] == "yes" else "disable", UNIT),
+    "FULLSCREEN_APPS": lambda conf: E.write_prompt_env(conf["CONSOLE_TTY"], conf),
+    "ERIS_GLYPHS": lambda conf: (apply_font(conf, force=True), E.write_prompt_env(conf["CONSOLE_TTY"], conf)),
+}
+
+
+def set_setting(key, value):
+    need_root()
+    if key == "CONSOLE_FONT":
+        return set_console_font(value or "default")
+    E.validate(key, value)
+    E.save_conf({key: value})
+    conf = E.load_conf()
+    if key in SIDE_EFFECTS:
+        SIDE_EFFECTS[key](conf)
+    note = ""
+    if key == "PROMPT_SCOPE":
+        note = " (new shells; this one: source ~/.bashrc)"
+    elif key in ("DASH_HEIGHT", "REFRESH", "WEATHER", "WEATHER_CITY", "WEATHER_UNITS", "CHARSET", "FULLSCREEN_APPS"):
+        note = " (a running dashboard picks it up within a second)"
+    E.log("set %s=%s" % (key, value))
+    return "%s=%s%s" % (key, value, note)
+
+
+def cmd_config():
+    conf = E.load_conf()
+    for k in E.SETTINGS:
+        print('%-15s = "%s"   # %s' % (k, conf[k], E.SETTINGS[k][1]))
+    return 0
+
+
+# ---------------------------------------------------------------- menu
+
+def ask(prompt):
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        return None
+
+
+def menu():
+    need_root()
+    while True:
+        conf = E.load_conf()
+        tty = conf["CONSOLE_TTY"]
+        on = svc_state() == "active"
+        try:
+            cs = E.choose_charset(conf, tty)
+            w, h, n = E.font_info(tty)
+            fd = E.open_tty(tty, write=False)
+            rows, cols, _, _ = E.console_geometry(fd, tty)
+            os.close(fd)
+            fontdesc = "%s (%dx%d glyphs, console %dx%d)" % (conf["CONSOLE_FONT"] or "system", w, h, cols, rows)
+        except OSError:
+            cs, fontdesc = "?", conf["CONSOLE_FONT"] or "system"
+        city = conf["WEATHER_CITY"] or "auto (by IP)"
+        print()
+        print(" " + c(PINK, "E") + c(PINK, "R") + c(BLUE, "I") + c(BLUE, "S") + c(WHITE, " Console settings") +
+              "      dashboard: %s, %s at boot" % (c(GREEN, "ON") if on else c(GREY, "OFF"),
+                                                  "starts" if conf["DASH_AT_BOOT"] == "yes" else "not started"))
+        items = [
+            ("1", "Dashboard height", "%s %%" % conf["DASH_HEIGHT"]),
+            ("2", "Refresh interval", "%s s" % conf["REFRESH"]),
+            ("3", "Weather", "%s  city: %s  units: %s" % (conf["WEATHER"], city, conf["WEATHER_UNITS"])),
+            ("4", "Palette", conf["PALETTE"]),
+            ("5", "Character set", "%s (now %s)" % (conf["CHARSET"], cs)),
+            ("6", "Prompt scope", conf["PROMPT_SCOPE"]),
+            ("7", "Dashboard at boot", conf["DASH_AT_BOOT"]),
+            ("8", "Console font size", fontdesc),
+            ("9", "Screen blanking", "never" if conf["BLANK_MINUTES"] == "0" else conf["BLANK_MINUTES"] + " min"),
+            ("10", "Kernel messages on screen", "no (hidden)" if conf["KERNEL_MSGS"] == "hidden" else "yes"),
+            ("11", "ERIS glyphs (Clawd, icons)", conf["ERIS_GLYPHS"]),
+        ]
+        for k, label, val in items:
+            print("  %s %s %s" % (c(CYAN, "%2s)" % k), label.ljust(26, "."), c(AMBER, val)))
+        print("  %s start now   %s stop now   %s quit" % (c(GREEN, " s)"), c(RED, "x)"), c(PURPLE, "q)")))
+        ch = ask(" > ")
+        if ch is None or ch.lower() in ("q", ""):
+            return 0
+        try:
+            msg = menu_item(ch.lower(), conf)
+        except (ValueError, RuntimeError, OSError) as e:
+            msg = c(RED, "not changed: %s" % e)
+        if msg:
+            print("  " + msg)
+
+
+def choose(prompt, options, cur):
+    print("   " + "  ".join("%s %s" % (c(CYAN, "%d)" % (i + 1)), o + (" *" if o == cur else "")) for i, o in enumerate(options)))
+    a = ask("   %s [1-%d]: " % (prompt, len(options)))
+    if a and a.isdigit() and 1 <= int(a) <= len(options):
+        return options[int(a) - 1]
+    return None
+
+
+def menu_item(ch, conf):
+    if ch == "1":
+        v = ask("   dashboard height in %% (15-70) [%s]: " % conf["DASH_HEIGHT"])
+        return set_setting("DASH_HEIGHT", v) if v else None
+    if ch == "2":
+        v = ask("   refresh seconds (1-30) [%s]: " % conf["REFRESH"])
+        return set_setting("REFRESH", v) if v else None
+    if ch == "3":
+        v = choose("weather", ["on", "off"], conf["WEATHER"])
+        out = [set_setting("WEATHER", v)] if v else []
+        city = ask("   city (empty = keep '%s', '-' = auto by IP): " % (conf["WEATHER_CITY"] or "auto"))
+        if city:
+            out.append(set_setting("WEATHER_CITY", "" if city == "-" else city))
+        u = choose("units", ["C", "F"], conf["WEATHER_UNITS"])
+        if u:
+            out.append(set_setting("WEATHER_UNITS", u))
+        return "; ".join(out) or None
+    if ch == "4":
+        v = choose("palette", ["neon", "default"], conf["PALETTE"])
+        return set_setting("PALETTE", v) if v else None
+    if ch == "5":
+        v = choose("charset", ["auto", "utf8", "safe", "ascii"], conf["CHARSET"])
+        return set_setting("CHARSET", v) if v else None
+    if ch == "6":
+        v = choose("prompt scope", ["tty1", "all"], conf["PROMPT_SCOPE"])
+        return set_setting("PROMPT_SCOPE", v) if v else None
+    if ch == "7":
+        v = choose("dashboard at boot", ["yes", "no"], conf["DASH_AT_BOOT"])
+        return set_setting("DASH_AT_BOOT", v) if v else None
+    if ch == "8":
+        return font_menu(conf)
+    if ch == "9":
+        v = choose("blank the screen after", ["never", "5", "10", "15", "30", "60"],
+                   "never" if conf["BLANK_MINUTES"] == "0" else conf["BLANK_MINUTES"])
+        return set_setting("BLANK_MINUTES", "0" if v == "never" else v) if v else None
+    if ch == "10":
+        v = choose("kernel messages on the console", ["hidden", "shown"], conf["KERNEL_MSGS"])
+        return set_setting("KERNEL_MSGS", v) if v else None
+    if ch == "11":
+        v = choose("ERIS glyphs in the console font", ["on", "off"], conf["ERIS_GLYPHS"])
+        return set_setting("ERIS_GLYPHS", v) if v else None
+    if ch == "s":
+        cmd_on()
+        return None
+    if ch == "x":
+        cmd_off()
+        return None
+    return "unknown choice"
+
+
+def font_menu(conf):
+    bold = False
+    while True:
+        table = font_table(bold)
+        res = E.fb_resolution()
+        print("   Console font (screen %s). Terminus %s, best charset per size (Uni3 > Uni2 > Lat15):" % (
+            "%dx%d" % res if res else "?", "Bold" if bold else "regular"))
+        for i, (f, grid) in enumerate(table):
+            print("   %s %-6s -> %-8s %s" % (c(CYAN, "%2d)" % (i + 1)), "%dx%d" % (f["w"], f["h"]), grid, f["name"]))
+        print("   %s system default (console-setup)   %s %s   %s back" % (
+            c(CYAN, " d)"), c(CYAN, "b)"), "regular" if bold else "bold", c(CYAN, "q)")))
+        a = ask("   font: ")
+        if not a or a == "q":
+            return None
+        if a == "b":
+            bold = not bold
+            continue
+        if a == "d":
+            return set_console_font("default")
+        if a.isdigit() and 1 <= int(a) <= len(table):
+            return set_console_font(table[int(a) - 1][0]["name"])
+        print("   unknown choice")
+
+
+# ---------------------------------------------------------------- misc commands
+
+def cmd_reset_tty(args):
+    conf = E.load_conf()
+    tty = conf["CONSOLE_TTY"]
+    sf = os.path.join(E.RUN_DIR, "dashboard-tty%d.state" % E.tty_index(tty))
+    st = {}
+    if os.path.exists(sf):
+        for line in open(sf):
+            k, _, v = line.strip().partition("=")
+            st[k] = v
+    if "--if-dirty" in args and not st:
+        return 0
+    fd = E.open_tty(tty)
+    try:
+        rows, cols, cy, cx = E.console_geometry(fd, tty)
+        s = "\033[?6l\033[r"
+        h = int(st.get("H", "0") or 0)
+        if h and st.get("ASIDE") != "1":
+            s += "\033[1;1H\033[%dM" % h
+            cy = max(0, cy - h)
+        s += "\033[0m\033[%d;%dH" % (cy + 1, cx + 1)
+        E.write_all(fd, s)
+    finally:
+        os.close(fd)
+    for p in (sf,):
+        try:
+            os.unlink(p)
+        except FileNotFoundError:
+            pass
+    E.log("reset-tty %s (dashboard rows %s)" % (tty, st.get("H", "0")))
+    return 0
+
+
+def cmd_selftest():
+    results = []
+
+    def check(name, ok, detail=""):
+        results.append(ok)
+        print("  %s %s %s" % (c(GREEN, "PASS") if ok else c(RED, "FAIL"), name, detail))
+
+    print(c(PINK, "ERIS") + " selftest")
+    for f in ("/usr/local/lib/eris/erislib.py", DAEMON, "/usr/local/bin/eris"):
+        try:
+            compile(open(f).read(), f, "exec")
+            check("python syntax", True, f)
+        except (OSError, SyntaxError) as e:
+            check("python syntax", False, "%s: %s" % (f, e))
+    for f in ("/etc/eris/prompt.bash", "/usr/local/sbin/eris-uninstall"):
+        r = sh("bash", "-n", f)
+        check("bash syntax", r.returncode == 0, f + (" " + r.stderr.strip() if r.returncode else ""))
+    conf = E.load_conf()
+    bad = [k for k in E.SETTINGS if not E.SETTINGS[k][2](conf[k])]
+    check("settings valid", not bad, E.CONF + (" bad: %s" % bad if bad else ""))
+    for u in (LOOK_UNIT, UNIT):
+        r = sh("systemctl", "cat", u)
+        check("unit installed", r.returncode == 0, u)
+    check("look unit enabled", svc_enabled(LOOK_UNIT) == "enabled", LOOK_UNIT)
+    # render the dashboard at many sizes / charsets: every row exactly as wide as the console
+    sys.path.insert(0, "/usr/local/lib/eris")
+    import erisd
+    col = erisd.Collector(conf)
+    deadline = time.time() + 20
+    while time.time() < deadline and col.storage.snap is None:
+        time.sleep(0.3)
+    time.sleep(0.5)
+    d = col.snapshot()
+    col.stop()
+    strip = re.compile(r"\x1b\[[0-9;]*m")
+    worst = []
+    for rows, cols in ((67, 240), (90, 320), (45, 160), (33, 120), (25, 80), (30, 100), (20, 60), (12, 40), (8, 30)):
+        for cs in ("utf8", "safe", "ascii"):
+            H = erisd.dash_height(rows, int(conf["DASH_HEIGHT"]))
+            lines = erisd.render(d, cols, H, erisd.Theme(cs), 0)
+            widths = {len(strip.sub("", ln)) for ln in lines}
+            if len(lines) != H or widths - {cols}:
+                worst.append("%dx%d/%s rows=%d widths=%s" % (cols, rows, cs, len(lines), sorted(widths)))
+    check("dashboard layout (27 size/charset combinations)", not worst, "; ".join(worst[:3]))
+    cpu = d["cpu"]
+    temps = [p["temp"] for p in cpu["per"]] + [cpu["pkg"]]
+    check("CPU temps sane", all(t is None or -30 < t < 150 for t in temps), str(temps))
+    check("memory read", bool(d["mem"] and d["mem"]["total"] > 0))
+    check("disks found", bool(d["storage"] and d["storage"]["phys"]),
+          ", ".join(dk["name"] for dk in (d["storage"] or {}).get("phys", [])))
+    tty = conf["CONSOLE_TTY"]
+    if os.path.exists(tty):
+        try:
+            check("console font has a unicode map", len(E.tty_unicode_set(tty)) >= 200, tty)
+        except OSError as e:
+            check("console font has a unicode map", False, str(e))
+    ok = all(results)
+    print("  %s" % (c(GREEN, "all %d checks passed" % len(results)) if ok else c(RED, "%d of %d checks failed" % (results.count(False), len(results)))))
+    return 0 if ok else 1
+
+
+def main(argv):
+    if not argv:
+        if sys.stdin.isatty():
+            return menu()
+        return cmd_status()
+    cmd, args = argv[0], argv[1:]
+    try:
+        if cmd == "on":
+            return cmd_on()
+        if cmd == "off":
+            return cmd_off()
+        if cmd == "toggle":
+            return cmd_toggle()
+        if cmd == "enable":
+            return cmd_enable()
+        if cmd == "disable":
+            return cmd_disable()
+        if cmd == "status":
+            return cmd_status()
+        if cmd in ("menu", "settings"):
+            return menu()
+        if cmd == "set" and len(args) >= 1:
+            print(set_setting(args[0].upper(), " ".join(args[1:])))
+            return 0
+        if cmd == "get" and len(args) == 1:
+            print(E.load_conf().get(args[0].upper(), ""))
+            return 0
+        if cmd == "config":
+            return cmd_config()
+        if cmd == "font":
+            return cmd_font(args)
+        if cmd == "apply":
+            mode = "boot" if "--boot" in args else "login" if "--login" in args else "now"
+            return apply_console(mode, quiet=(mode != "now"))
+        if cmd == "reset-tty":
+            return cmd_reset_tty(args)
+        if cmd == "render":
+            size = args[0] if args else None
+            if not size:
+                conf = E.load_conf()
+                fd = E.open_tty(conf["CONSOLE_TTY"], write=False)
+                r, cl, _, _ = E.console_geometry(fd, conf["CONSOLE_TTY"])
+                os.close(fd)
+                size = "%dx%d" % (r, cl)
+            os.execv(sys.executable, [sys.executable, DAEMON, "--render", size] + args[1:2])
+        if cmd == "selftest":
+            return cmd_selftest()
+        if cmd in ("version", "--version"):
+            print(E.VERSION)
+            return 0
+    except ValueError as e:
+        print("eris: %s" % e)
+        return 2
+    print(__doc__.strip())
+    return 0 if cmd in ("help", "-h", "--help") else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
