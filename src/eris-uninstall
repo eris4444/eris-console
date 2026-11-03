@@ -21,6 +21,24 @@ for u in eris-dashboard.service eris-console.service; do
   fi
 done
 
+# 1b. firewall: only ERIS's own nftables table goes (Docker's tables are not touched)
+for u in eris-fw-rollback eris-fw-auto-on; do
+  systemctl stop "$u.service" > /dev/null 2>&1
+done
+if [ -e /etc/eris/firewall.conf ] || [ -e /etc/eris/guard.nft ]; then
+  fwbk=/var/backups/eris/fw-uninstall-$(date +%Y%m%d-%H%M%S)
+  mkdir -p "$fwbk"
+  for f in /etc/eris/firewall.conf /etc/eris/guard.nft; do [ -e "$f" ] && cp -a "$f" "$fwbk/"; done
+  say "firewall settings saved in $fwbk"
+fi
+if systemctl cat eris-guard.service > /dev/null 2>&1; then
+  timeout 30 systemctl disable --now eris-guard.service > /dev/null 2>&1
+  say "stopped and disabled eris-guard.service"
+fi
+if command -v nft > /dev/null && nft list table inet eris_guard > /dev/null 2>&1; then
+  nft delete table inet eris_guard && say "removed the nftables table inet eris_guard: the ERIS firewall is off"
+fi
+
 # 2. kernel default palette, console blanking, scroll region / origin mode
 if [ -r "$ST/vt-default.orig" ]; then
   while IFS='=' read -r k v; do
@@ -71,6 +89,7 @@ done
 
 # 6. files
 for f in /etc/systemd/system/eris-dashboard.service /etc/systemd/system/eris-console.service \
+         /etc/systemd/system/eris-guard.service \
          /usr/local/bin/eris /usr/local/lib/eris /etc/eris /run/eris "$ST"; do
   if [ -e "$f" ]; then
     rm -rf "$f"
