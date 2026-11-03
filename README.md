@@ -54,6 +54,7 @@ eris apply                re-apply the console look
 eris render [ROWSxCOLS] [utf8|safe|ascii]   print one dashboard frame here
 eris fw ...               the firewall (see below; eris fw help)
 eris selftest             quick checks of the installed files
+eris update [--check]     install the latest release from this repository (settings stay)
 ```
 
 Settings are in `/etc/eris/eris.conf`:
