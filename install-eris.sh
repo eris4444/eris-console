@@ -9,7 +9,7 @@
 #   bash install-eris.sh --uninstall     remove everything (same as eris-uninstall)
 #   bash install-eris.sh --no-selftest   skip the checks at the end
 set -euo pipefail
-VERSION=2.1.0
+VERSION=2.2.0
 LOG=/var/log/eris-build.log
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/var/backups/eris/$TS
@@ -148,7 +148,11 @@ import subprocess
 import termios
 import time
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
+REPO = os.environ.get("ERIS_REPO", "eris4444/eris-console")
+REPO_URL = "https://github.com/" + REPO
+RELEASES_API = "https://api.github.com/repos/%s/releases/latest" % REPO
+DOWNLOAD_URL = REPO_URL + "/releases/download/%s/install-eris.sh"
 CONF = "/etc/eris/eris.conf"
 STATE_DIR = "/var/lib/eris"
 RUN_DIR = "/run/eris"
@@ -5016,6 +5020,7 @@ ERIS_EOF_fw_rollback
   eris fw [open|close|allow|deny|remove|limit|reload|confirm|off|on|backup|restore ...]
                             the firewall (eris fw help); eris firewall works too
   eris selftest             quick checks of the installed files
+  eris update [--check|--force]   install the latest release (github.com/eris4444/eris-console)
   eris version
 """
 import glob
@@ -5501,7 +5506,8 @@ def menu():
         ]
         for k, label, val in items:
             print("  %s %s %s" % (c(CYAN, "%2s)" % k), label.ljust(26, "."), c(AMBER, val)))
-        print("  %s start now   %s stop now   %s quit" % (c(GREEN, " s)"), c(RED, "x)"), c(PURPLE, "q)")))
+        print("  %s start now   %s stop now   %s update   %s quit" % (
+            c(GREEN, " s)"), c(RED, "x)"), c(BLUE, "u)"), c(PURPLE, "q)")))
         ch = ask(" > ")
         if ch is None or ch.lower() in ("q", ""):
             return 0
@@ -5572,6 +5578,9 @@ def menu_item(ch, conf):
     if ch == "x":
         cmd_off()
         return None
+    if ch == "u":
+        cmd_update([])
+        return None
     return "unknown choice"
 
 
@@ -5605,6 +5614,58 @@ def font_menu(conf):
         if a.isdigit() and 1 <= int(a) <= len(table):
             return set_console_font(table[int(a) - 1][0]["name"])
         print("   unknown choice")
+
+
+# ---------------------------------------------------------------- update
+
+def version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+def latest_release():
+    """Tag of the newest ERIS Console release on GitHub."""
+    import json
+    import urllib.request
+    req = urllib.request.Request(E.RELEASES_API, headers={"Accept": "application/vnd.github+json",
+                                                          "User-Agent": "eris-console/%s" % E.VERSION})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)["tag_name"]
+
+
+def cmd_update(args):
+    """Download the latest release's install-eris.sh and run it (settings and the dashboard state stay)."""
+    need_root()
+    import tempfile
+    import urllib.request
+    try:
+        tag = latest_release()
+    except OSError as e:
+        print(c(RED, "eris update: GitHub did not answer (%s)" % e))
+        return 1
+    have, new = version_tuple(E.VERSION), version_tuple(tag)
+    print("  installed %s, latest release %s (%s)" % (E.VERSION, tag, E.REPO_URL))
+    if "--check" in args:
+        return 0 if new <= have else 10
+    if new <= have and "--force" not in args:
+        print("  " + c(GREEN, "up to date"))
+        return 0
+    url = E.DOWNLOAD_URL % tag
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "install-eris.sh")
+        try:
+            with urllib.request.urlopen(url, timeout=120) as r, open(path, "wb") as f:
+                shutil.copyfileobj(r, f)
+        except OSError as e:
+            print(c(RED, "eris update: download failed: %s (%s)" % (url, e)))
+            return 1
+        head = open(path, "rb").read(4096)
+        if not head.startswith(b"#!/bin/bash") or b"ERIS Console" not in head:
+            print(c(RED, "eris update: %s is not the ERIS Console installer" % url))
+            return 1
+        print("  installing %s ..." % tag)
+        rc = subprocess.call(["bash", path])
+    print("  " + (c(GREEN, "updated to %s" % tag) if rc == 0 else c(RED, "the installer failed (%d), see %s" % (rc, "/var/log/eris-build.log"))))
+    return rc
 
 
 # ---------------------------------------------------------------- misc commands
@@ -5763,6 +5824,8 @@ def main(argv):
             return erisfw.main(args)
         if cmd == "selftest":
             return cmd_selftest()
+        if cmd in ("update", "upgrade"):
+            return cmd_update(args)
         if cmd in ("version", "--version"):
             print(E.VERSION)
             return 0
@@ -6081,6 +6144,6 @@ rc=0
 if [ "$SELFTEST" = 1 ]; then
   /usr/local/bin/eris selftest || rc=$?
 fi
-say "done. Commands: eris (menu) | eris on | eris off | eris toggle | eris enable | eris disable | eris status | eris fw"
+say "done. Commands: eris (menu) | eris on | eris off | eris toggle | eris enable | eris disable | eris status | eris fw | eris update"
 say "remove: eris-uninstall   (or: bash $0 --uninstall)"
 exit $rc
