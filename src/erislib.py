@@ -14,7 +14,11 @@ import subprocess
 import termios
 import time
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
+REPO = os.environ.get("ERIS_REPO", "eris4444/eris-console")
+REPO_URL = "https://github.com/" + REPO
+RELEASES_API = "https://api.github.com/repos/%s/releases/latest" % REPO
+DOWNLOAD_URL = REPO_URL + "/releases/download/%s/install-eris.sh"
 CONF = "/etc/eris/eris.conf"
 STATE_DIR = "/var/lib/eris"
 RUN_DIR = "/run/eris"
