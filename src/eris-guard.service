@@ -1,0 +1,14 @@
+[Unit]
+Description=ERIS firewall (nftables table inet eris_guard; settings /etc/eris/firewall.conf, see eris fw)
+After=network-pre.target docker.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/eris/guard.nft
+ExecReload=/usr/sbin/nft -f /etc/eris/guard.nft
+ExecStop=-/usr/sbin/nft delete table inet eris_guard
+
+[Install]
+WantedBy=multi-user.target
