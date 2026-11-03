@@ -10,6 +10,8 @@
   eris font [list | set NAME|default | current]
   eris apply                re-apply the console look (font, palette, blanking, kernel messages)
   eris render [ROWSxCOLS] [utf8|safe|ascii]   print one dashboard frame here
+  eris fw [open|close|allow|deny|remove|limit|reload|confirm|off|on|backup|restore ...]
+                            the firewall (eris fw help); eris firewall works too
   eris selftest             quick checks of the installed files
   eris version
 """
@@ -492,6 +494,7 @@ def menu():
             ("9", "Screen blanking", "never" if conf["BLANK_MINUTES"] == "0" else conf["BLANK_MINUTES"] + " min"),
             ("10", "Kernel messages on screen", "no (hidden)" if conf["KERNEL_MSGS"] == "hidden" else "yes"),
             ("11", "ERIS glyphs (Clawd, icons)", conf["ERIS_GLYPHS"]),
+            ("12", "Firewall", fw_summary()),
         ]
         for k, label, val in items:
             print("  %s %s %s" % (c(CYAN, "%2s)" % k), label.ljust(26, "."), c(AMBER, val)))
@@ -556,6 +559,10 @@ def menu_item(ch, conf):
     if ch == "11":
         v = choose("ERIS glyphs in the console font", ["on", "off"], conf["ERIS_GLYPHS"])
         return set_setting("ERIS_GLYPHS", v) if v else None
+    if ch == "12":
+        import erisfw
+        erisfw.menu()
+        return None
     if ch == "s":
         cmd_on()
         return None
@@ -563,6 +570,14 @@ def menu_item(ch, conf):
         cmd_off()
         return None
     return "unknown choice"
+
+
+def fw_summary():
+    try:
+        import erisfw
+        return erisfw.summary()
+    except (ImportError, SyntaxError, OSError, ValueError) as e:
+        return "? (%s)" % e
 
 
 def font_menu(conf):
@@ -631,22 +646,33 @@ def cmd_selftest():
         print("  %s %s %s" % (c(GREEN, "PASS") if ok else c(RED, "FAIL"), name, detail))
 
     print(c(PINK, "ERIS") + " selftest")
-    for f in ("/usr/local/lib/eris/erislib.py", DAEMON, "/usr/local/bin/eris"):
+    for f in ("/usr/local/lib/eris/erislib.py", DAEMON, "/usr/local/lib/eris/erisfw.py", "/usr/local/bin/eris"):
         try:
             compile(open(f).read(), f, "exec")
             check("python syntax", True, f)
         except (OSError, SyntaxError) as e:
             check("python syntax", False, "%s: %s" % (f, e))
-    for f in ("/etc/eris/prompt.bash", "/usr/local/sbin/eris-uninstall"):
+    for f in ("/etc/eris/prompt.bash", "/usr/local/sbin/eris-uninstall", "/usr/local/lib/eris/fw-rollback"):
         r = sh("bash", "-n", f)
         check("bash syntax", r.returncode == 0, f + (" " + r.stderr.strip() if r.returncode else ""))
     conf = E.load_conf()
     bad = [k for k in E.SETTINGS if not E.SETTINGS[k][2](conf[k])]
     check("settings valid", not bad, E.CONF + (" bad: %s" % bad if bad else ""))
-    for u in (LOOK_UNIT, UNIT):
+    for u in (LOOK_UNIT, UNIT, "eris-guard.service"):
         r = sh("systemctl", "cat", u)
         check("unit installed", r.returncode == 0, u)
     check("look unit enabled", svc_enabled(LOOK_UNIT) == "enabled", LOOK_UNIT)
+    import erisfw as F
+    if os.path.isfile(F.FW_CONF):
+        _, errors = F.parse(open(F.FW_CONF).read())
+        check("firewall settings valid", not errors, F.FW_CONF + (" " + errors[0] if errors else ""))
+        r = sh(F.NFT, "-c", "-f", F.GUARD)
+        check("firewall rules pass nft -c", r.returncode == 0, F.GUARD + (" " + r.stderr.strip()[:120] if r.returncode else ""))
+        check("firewall loaded at boot", svc_enabled(F.UNIT) == "enabled", F.UNIT)
+        loaded = F.table_loaded()
+        check("firewall table matches its unit", loaded == (svc_state(F.UNIT) == "active"),
+              "table %s, unit %s" % ("loaded" if loaded else "not loaded", svc_state(F.UNIT)))
+        check("firewall rollback helper", os.access(F.ROLLBACK, os.X_OK), F.ROLLBACK)
     # render the dashboard at many sizes / charsets: every row exactly as wide as the console
     sys.path.insert(0, "/usr/local/lib/eris")
     import erisd
@@ -729,6 +755,9 @@ def main(argv):
                 os.close(fd)
                 size = "%dx%d" % (r, cl)
             os.execv(sys.executable, [sys.executable, DAEMON, "--render", size] + args[1:2])
+        if cmd in ("fw", "firewall"):
+            import erisfw
+            return erisfw.main(args)
         if cmd == "selftest":
             return cmd_selftest()
         if cmd in ("version", "--version"):
