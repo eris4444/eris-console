@@ -2,12 +2,14 @@
 # ERIS Console installer (self-contained).
 #   Layer A: neon black console + one-line prompt on the physical console (tty1), always on.
 #   Layer B: eris-dashboard.service, installed but OFF (start it with: eris on).
+#   Firewall (optional, OFF unless asked for): eris fw, nftables table inet eris_guard.
 #
-#   bash install-eris.sh                 install or upgrade
+#   bash install-eris.sh                 install or upgrade (an existing firewall is kept as it is)
+#   bash install-eris.sh --firewall      also set up the firewall on this server (eris fw setup)
 #   bash install-eris.sh --uninstall     remove everything (same as eris-uninstall)
 #   bash install-eris.sh --no-selftest   skip the checks at the end
 set -euo pipefail
-VERSION=2.0.0
+VERSION=2.1.0
 LOG=/var/log/eris-build.log
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/var/backups/eris/$TS
@@ -26,6 +28,7 @@ put_file() {  # DEST MODE < content
 
 [ "$(id -u)" -eq 0 ] || die "run as root"
 SELFTEST=1
+FIREWALL=0
 for a in "$@"; do
   case $a in
     --uninstall)
@@ -33,8 +36,9 @@ for a in "$@"; do
       tmp=$(mktemp)
       write_uninstaller "$tmp"
       bash "$tmp"; rc=$?; rm -f "$tmp"; exit $rc ;;
+    --firewall) FIREWALL=1 ;;
     --no-selftest) SELFTEST=0 ;;
-    -h | --help) sed -n '2,9p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,10p' "$0"; exit 0 ;;
     *) die "unknown option $a" ;;
   esac
 done
@@ -62,7 +66,8 @@ fi
 mkdir -p "$BK"
 for p in /root/.bashrc /root/.profile /etc/default/console-setup /etc/eris /usr/local/bin/eris /usr/local/lib/eris \
          /usr/local/sbin/eris-uninstall /etc/systemd/system/eris-console.service \
-         /etc/systemd/system/eris-dashboard.service /etc/sysctl.d/90-eris-console.conf; do
+         /etc/systemd/system/eris-dashboard.service /etc/systemd/system/eris-guard.service \
+         /etc/sysctl.d/90-eris-console.conf /var/lib/eris/firewall.applied; do
   if [ -e "$p" ]; then
     mkdir -p "$BK$(dirname "$p")"
     cp -a "$p" "$BK$p"
@@ -96,7 +101,7 @@ if missing:
 PY
   say "settings: kept /etc/eris/eris.conf"
 fi
-say "files: /usr/local/bin/eris, /usr/local/lib/eris/, /etc/eris/prompt.bash, eris-console.service, eris-dashboard.service, /usr/local/sbin/eris-uninstall"
+say "files: /usr/local/bin/eris, /usr/local/lib/eris/, /etc/eris/prompt.bash, eris-console.service, eris-dashboard.service, eris-guard.service, /usr/local/sbin/eris-uninstall"
 
 # 5. managed blocks in root's shell files (only these lines are ever touched)
 add_block() {  # FILE TEXT
@@ -126,11 +131,22 @@ fi
 [ "$was_on" = 1 ] && systemctl start eris-dashboard.service
 say "look applied: $(tail -n 1 "$LOG" | sed 's/^.*\] //' | cut -c1-160)"
 
-# 7. self-test
+# 7. firewall: optional; an upgrade never reloads or restarts it (the live rules stay as they are)
+if [ -e /etc/eris/firewall.conf ]; then
+  say "firewall: kept /etc/eris/firewall.conf and the live rules (eris fw)"
+elif [ -e /etc/eris/guard.nft ]; then
+  /usr/local/bin/eris fw import || say "warning: eris fw import refused; the old /etc/eris/guard.nft stays in use"
+elif [ "$FIREWALL" = 1 ]; then
+  /usr/local/bin/eris fw setup || say "warning: the firewall is not set up (later: eris fw setup)"
+else
+  say "firewall: not set up (optional: eris fw setup, or install with --firewall)"
+fi
+
+# 8. self-test
 rc=0
 if [ "$SELFTEST" = 1 ]; then
   /usr/local/bin/eris selftest || rc=$?
 fi
-say "done. Commands: eris (menu) | eris on | eris off | eris toggle | eris enable | eris disable | eris status"
+say "done. Commands: eris (menu) | eris on | eris off | eris toggle | eris enable | eris disable | eris status | eris fw"
 say "remove: eris-uninstall   (or: bash $0 --uninstall)"
 exit $rc
