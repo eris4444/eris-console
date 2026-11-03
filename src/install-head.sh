@@ -9,7 +9,7 @@
 #   bash install-eris.sh --uninstall     remove everything (same as eris-uninstall)
 #   bash install-eris.sh --no-selftest   skip the checks at the end
 set -euo pipefail
-VERSION=2.1.0
+VERSION=2.2.0
 LOG=/var/log/eris-build.log
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/var/backups/eris/$TS
@@ -147,6 +147,6 @@ rc=0
 if [ "$SELFTEST" = 1 ]; then
   /usr/local/bin/eris selftest || rc=$?
 fi
-say "done. Commands: eris (menu) | eris on | eris off | eris toggle | eris enable | eris disable | eris status | eris fw"
+say "done. Commands: eris (menu) | eris on | eris off | eris toggle | eris enable | eris disable | eris status | eris fw | eris update"
 say "remove: eris-uninstall   (or: bash $0 --uninstall)"
 exit $rc
