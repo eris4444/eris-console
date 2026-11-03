@@ -20,10 +20,13 @@ emit() {  # SRC DEST MODE
   emit erislib.py /usr/local/lib/eris/erislib.py 0644
   emit erisd.py /usr/local/lib/eris/erisd.py 0755
   emit erisfont.py /usr/local/lib/eris/erisfont.py 0644
+  emit erisfw.py /usr/local/lib/eris/erisfw.py 0644
+  emit fw-rollback /usr/local/lib/eris/fw-rollback 0755
   emit eris /usr/local/bin/eris 0755
   emit prompt.bash /etc/eris/prompt.bash 0644
   emit eris-console.service /etc/systemd/system/eris-console.service 0644
   emit eris-dashboard.service /etc/systemd/system/eris-dashboard.service 0644
+  emit eris-guard.service /etc/systemd/system/eris-guard.service 0644
   echo "  write_uninstaller /usr/local/sbin/eris-uninstall"
   echo "}"
   sed -n '/^#@@FILES@@$/,$p' install-head.sh | sed '1d'
