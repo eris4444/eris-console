@@ -16,6 +16,10 @@ A neon look for the physical console (tty1) of a headless Debian server, plus an
   - The dashboard uses the top part of tty1 (scroll region), so the shell below keeps working.
   - Full-screen programs (vim, htop, less, man, …) get the whole screen while they run.
   - Extra width or height spreads the text and grows the charts.
+- **Firewall (`eris fw`, optional, OFF unless you set it up)**
+  - One readable file, `/etc/eris/firewall.conf`: LAN networks, open ports with connection limits, allowed and blocked addresses.
+  - Every change is checked with `nft -c`, backed up, and rolled back after 60 seconds unless you confirm it.
+  - Localhost and SSH from the LAN always keep working. Only its own nftables table is touched, never Docker's.
 
 Everything is plain Python 3 and bash with no pip packages. The installer is one self-contained file.
 
@@ -31,7 +35,11 @@ The installer:
 - installs only missing packages (`python3 kbd console-setup smartmontools iproute2 procps util-linux pciutils`) and never upgrades anything;
 - backs up every file it touches to `/var/backups/eris/<time>/`.
 
-Options: `--no-selftest`, `--uninstall`.
+Options:
+- `--firewall`: also set up the firewall (`eris fw setup`; asks what to open when run in a terminal);
+- `--no-selftest`, `--uninstall`.
+
+An upgrade never reloads or restarts an existing firewall. An older hand-written `/etc/eris/guard.nft` is taken over with `eris fw import`, but only if the result gives exactly the same rules.
 
 ## Use
 
@@ -44,6 +52,7 @@ eris set KEY VALUE        change a setting (eris config lists them)
 eris font [list | set NAME|default | current]
 eris apply                re-apply the console look
 eris render [ROWSxCOLS] [utf8|safe|ascii]   print one dashboard frame here
+eris fw ...               the firewall (see below; eris fw help)
 eris selftest             quick checks of the installed files
 ```
 
@@ -66,13 +75,52 @@ Settings are in `/etc/eris/eris.conf`:
 - **Proxy:** requests go through `/etc/eris/ai-proxy` when that file contains a proxy URL.
 - **Not logged in:** the panel shows a hint instead.
 
+## Firewall (optional)
+
+`eris fw setup` (or `install-eris.sh --firewall`) writes `/etc/eris/firewall.conf` from the server's own networks. From then on, `eris-guard.service` loads the rules at boot. The rules live in an nftables table of their own, `inet eris_guard`.
+
+```
+lan 192.168.1.0/24            # full access: LAN and Docker networks (IPv4 or IPv6)
+lan 172.16.0.0/12
+open 443/tcp limit 300        # reachable from the Internet, at most 300 parallel connections
+open 51820/udp
+allow 203.0.113.7             # full access for one Internet address
+deny 198.51.100.0/24          # blocked (SSH from the LAN still works)
+limit-per total               # total: a limit is shared by all addresses; address: one for each address
+docker lan-only               # Docker-published ports only from the lan networks
+ping on
+```
+
+| Command | What it does |
+| --- | --- |
+| `eris fw` | status: open ports, LAN networks and custom rules (numbered), drop counters, current connections |
+| `eris fw open PORT[/udp] [limit N]` / `close PORT[/udp]` | open a port to the Internet / close it |
+| `eris fw allow ADDR[/PREFIX]` / `deny ADDR[/PREFIX]` | full access / block an address or network |
+| `eris fw remove N` | remove entry N of the status list |
+| `eris fw limit PORT N` | parallel connection limit (0 = none) |
+| `eris fw set limit-per\|docker\|ping VALUE` | the options |
+| `eris fw reload` | load `firewall.conf` after editing it by hand |
+| `eris fw confirm` | keep a change (Enter does the same when you run it in a terminal) |
+| `eris fw off [MINUTES]` / `on` | switch it off (for a while, or until `on` / the next boot) / on again |
+| `eris fw backup` / `restore [N]` | save the settings / bring a saved version back |
+
+The `eris` menu has the same options under **Firewall**: you pick everything by number.
+
+Safety:
+- **Before loading:** every change is checked with `nft -c` and backed up to `/var/backups/eris/fw-*`.
+- **Rollback:** a change that nobody confirms within 60 seconds is rolled back (Enter, `n` = undo at once). New rules exist only in `/run` until you confirm them, so a reboot also brings back the old ones.
+- **SSH:** localhost and SSH from the LAN are always allowed, even from a blocked LAN address. `eris fw` refuses any change that would block the SSH session you are connected from, unless you explicitly agree.
+- **Explicit consent:** opening SSH to the Internet needs `--open-ssh` (or typing `open ssh` in a terminal). Admin panels (x-ui, Cockpit, Webmin, Portainer, openmediavault), file sharing, databases and very large `allow` ranges need `--force` (or typing `yes`).
+- **Warnings:** you get one for a port nothing listens on, a port that only listens on localhost, or a Docker port.
+- **Outside changes:** changes made to the live table outside `eris fw` (for example `nft add element` by hand) are shown, and replacing them needs a confirmation.
+
 ## Remove
 
 ```bash
 sudo eris-uninstall
 ```
 
-This removes the files, services and shell blocks, and restores the original console settings.
+This removes the files, services and shell blocks, and restores the original console settings. The firewall table `inet eris_guard` and `eris-guard.service` are removed too. A copy of `firewall.conf` stays in `/var/backups/eris/fw-uninstall-*`.
 
 ## Build from source
 
