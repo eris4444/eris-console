@@ -1,0 +1,30 @@
+#!/bin/bash
+# ERIS firewall: undo a change nobody confirmed in time.
+# Run by the transient eris-fw-rollback.service (sleep 60, then this) that `eris fw` starts before it
+# loads new rules (`eris fw confirm` stops it). The confirmed rules are always in /etc/eris/guard.nft;
+# the unconfirmed ones live only in /run/eris/fw-pending, so a reboot also drops them.
+set -u
+P=/run/eris/fw-pending
+CONF=/etc/eris/firewall.conf
+APPLIED=/var/lib/eris/firewall.applied
+GUARD=/etc/eris/guard.nft
+mkdir -p /run/eris
+exec 9> /run/eris/fw.lock
+flock -w 60 9 || true   # never block the way back for good
+[ -d "$P" ] || exit 0
+reason=$(cat "$P/reason" 2> /dev/null)
+if [ -f "$GUARD" ] && [ ! -e "$P/setup" ]; then
+  if /usr/sbin/nft -f "$GUARD"; then what="the previous rules are loaded again"; else what="FAILED to load $GUARD"; fi
+else
+  /usr/sbin/nft delete table inet eris_guard 2> /dev/null
+  what="the firewall table is removed again (it was not set up before)"
+fi
+if [ -f "$APPLIED" ] && [ -f "$CONF" ] && ! cmp -s "$APPLIED" "$CONF"; then
+  cp -f "$CONF" "$CONF.rejected"
+  cp -f "$APPLIED" "$CONF"
+  what="$what; your edited firewall.conf is saved as $CONF.rejected"
+fi
+rm -rf "$P"
+date +%s > /run/eris/fw-loaded
+printf '%s %s: %s\n' "$(date +%H:%M:%S)" "${reason:-change}" "$what" > /run/eris/fw-last-rollback
+printf '%s [fw] rolled back (%s): %s\n' "$(date '+%F %T')" "${reason:-change}" "$what" >> /var/log/eris-build.log
