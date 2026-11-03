@@ -14,7 +14,7 @@ import subprocess
 import termios
 import time
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 CONF = "/etc/eris/eris.conf"
 STATE_DIR = "/var/lib/eris"
 RUN_DIR = "/run/eris"
