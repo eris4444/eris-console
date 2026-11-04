@@ -12,6 +12,8 @@
   eris render [ROWSxCOLS] [utf8|safe|ascii]   print one dashboard frame here
   eris fw [open|close|allow|deny|remove|limit|reload|confirm|off|on|backup|restore ...]
                             the firewall (eris fw help); eris firewall works too
+  eris backup [now|list|status|verify N]   settings and databases into BACKUP_DIR (nightly too)
+  eris restore N|FILE [--to DIR] [--only PATH ...] [--yes]   put a backup back (N from eris backup list)
   eris selftest             quick checks of the installed files
   eris update [--check|--force]   install the latest release (github.com/eris4444/eris-console)
   eris version
@@ -426,6 +428,7 @@ SIDE_EFFECTS = {
     "DASH_AT_BOOT": lambda conf: sh("systemctl", "enable" if conf["DASH_AT_BOOT"] == "yes" else "disable", UNIT),
     "FULLSCREEN_APPS": lambda conf: E.write_prompt_env(conf["CONSOLE_TTY"], conf),
     "ERIS_GLYPHS": lambda conf: (apply_font(conf, force=True), E.write_prompt_env(conf["CONSOLE_TTY"], conf)),
+    "BACKUP_AT": lambda conf: write_backup_timer(conf),
 }
 
 
@@ -441,8 +444,11 @@ def set_setting(key, value):
     note = ""
     if key == "PROMPT_SCOPE":
         note = " (new shells; this one: source ~/.bashrc)"
-    elif key in ("DASH_HEIGHT", "REFRESH", "WEATHER", "WEATHER_CITY", "WEATHER_UNITS", "CHARSET", "FULLSCREEN_APPS"):
+    elif key in ("DASH_HEIGHT", "REFRESH", "WEATHER", "WEATHER_CITY", "WEATHER_UNITS", "CHARSET", "FULLSCREEN_APPS",
+                 "MARZBAN", "ALERTS", "ALERT_CPU_TEMP", "ALERT_DISK_TEMP"):
         note = " (a running dashboard picks it up within a second)"
+    elif key == "BACKUP_DIR" and value:
+        note = " (nightly at %s; now: eris backup)" % conf["BACKUP_AT"]
     E.log("set %s=%s" % (key, value))
     return "%s=%s%s" % (key, value, note)
 
@@ -496,6 +502,7 @@ def menu():
             ("10", "Kernel messages on screen", "no (hidden)" if conf["KERNEL_MSGS"] == "hidden" else "yes"),
             ("11", "ERIS glyphs (Clawd, icons)", conf["ERIS_GLYPHS"]),
             ("12", "Firewall", fw_summary()),
+            ("13", "Nightly backup", backup_summary(conf)),
         ]
         for k, label, val in items:
             print("  %s %s %s" % (c(CYAN, "%2s)" % k), label.ljust(26, "."), c(AMBER, val)))
@@ -565,6 +572,8 @@ def menu_item(ch, conf):
         import erisfw
         erisfw.menu()
         return None
+    if ch == "13":
+        return backup_menu(conf)
     if ch == "s":
         cmd_on()
         return None
@@ -607,6 +616,182 @@ def font_menu(conf):
         if a.isdigit() and 1 <= int(a) <= len(table):
             return set_console_font(table[int(a) - 1][0]["name"])
         print("   unknown choice")
+
+
+# ---------------------------------------------------------------- backup
+
+BACKUP_TIMER = "/etc/systemd/system/eris-backup.timer"
+
+
+def write_backup_timer(conf):
+    import erisbackup as B
+    with open(BACKUP_TIMER, "w") as f:
+        f.write(B.timer_text(conf["BACKUP_AT"]))
+    sh("systemctl", "daemon-reload")
+    sh("systemctl", "enable", "--now", "eris-backup.timer")
+    sh("systemctl", "restart", "eris-backup.timer")
+
+
+def backup_summary(conf):
+    import erisbackup as B
+    if not conf["BACKUP_DIR"]:
+        return "off (set a folder: eris set BACKUP_DIR /path)"
+    st = B.load_state()
+    last = st.get("last_ok_epoch")
+    when = ("last %s ago" % B.age_text(time.time() - last)) if last else "no backup yet"
+    if st.get("last_error_epoch", 0) > (last or 0):
+        when = "LAST ONE FAILED: %s" % st.get("last_error", "")[:40]
+    return "%s at %s, keep %s, %s" % (conf["BACKUP_DIR"], conf["BACKUP_AT"], conf["BACKUP_KEEP"], when)
+
+
+def pick_archive(conf, ref):
+    """An archive from a number of `eris backup list` or a file path."""
+    import erisbackup as B
+    if ref and os.path.isfile(ref):
+        return ref
+    lst = B.archives(conf["BACKUP_DIR"])
+    if ref and ref.isdigit() and 1 <= int(ref) <= len(lst):
+        return lst[int(ref) - 1][0]
+    raise ValueError("no backup %r (see: eris backup list)" % ref)
+
+
+def cmd_backup(args):
+    need_root()
+    import erisbackup as B
+    conf = E.load_conf()
+    sub = args[0] if args else "now"
+    quiet = "--quiet" in args
+    if sub in ("now", "run", "--quiet"):
+        if "--if-set" in args and not conf["BACKUP_DIR"]:
+            return 0
+        try:
+            path = B.make(conf["BACKUP_DIR"], int(conf["BACKUP_KEEP"]), conf["BACKUP_OWNER"],
+                          log=(lambda *_: None) if quiet else print)
+        except Exception as e:
+            B.save_state(last_error="%s" % e, last_error_epoch=int(time.time()), last_error_at=B.now_iso())
+            E.log("backup failed: %s" % e)
+            print(c(RED, "eris backup: %s" % e))
+            return 1
+        ok, msg = B.verify(path)
+        size = os.path.getsize(path)
+        if not ok:
+            B.save_state(last_error="written but %s" % msg, last_error_epoch=int(time.time()), last_error_at=B.now_iso())
+            print(c(RED, "eris backup: %s was written but %s" % (path, msg)))
+            return 1
+        B.save_state(last_ok=path, last_ok_epoch=int(time.time()), last_ok_at=B.now_iso(), last_size=size,
+                     last_error="", last_error_epoch=0)
+        E.log("backup %s (%s, %s)" % (path, E.human(size), msg))
+        if not quiet:
+            print("  " + c(GREEN, "backup %s" % path) + "  %s, %s" % (E.human(size), msg))
+        return 0
+    if sub in ("list", "ls"):
+        lst = B.archives(conf["BACKUP_DIR"])
+        if not conf["BACKUP_DIR"]:
+            print("no backup folder: eris set BACKUP_DIR /path/to/folder")
+            return 1
+        print("  %s (keep %s, nightly at %s)" % (conf["BACKUP_DIR"], conf["BACKUP_KEEP"], conf["BACKUP_AT"]))
+        for i, (p, t) in enumerate(lst):
+            print("  %s %s  %8s  %s" % (c(CYAN, "%2d)" % (i + 1)), time.strftime("%Y-%m-%d %H:%M", time.localtime(t)),
+                                        E.human(os.path.getsize(p)), os.path.basename(p)))
+        if not lst:
+            print("  (no backups yet: eris backup)")
+        return 0
+    if sub == "status":
+        print("  " + backup_summary(conf))
+        st = B.load_state()
+        for k in ("last_ok", "last_ok_at", "last_size", "last_error", "last_error_at"):
+            if st.get(k):
+                print("  %-14s %s" % (k, E.human(st[k]) if k == "last_size" else st[k]))
+        print("  timer: %s, next: %s" % (svc_state("eris-backup.timer"),
+                                          sh("systemctl", "show", "-p", "NextElapseUSecRealtime", "--value",
+                                             "eris-backup.timer").stdout.strip() or "?"))
+        return 0
+    if sub == "verify":
+        path = pick_archive(conf, args[1] if len(args) > 1 else "1")
+        ok, msg = B.verify(path)
+        print("  %s: %s" % (os.path.basename(path), c(GREEN, "ok, " + msg) if ok else c(RED, msg)))
+        return 0 if ok else 1
+    print("usage: eris backup [now|list|status|verify N]")
+    return 2
+
+
+def cmd_restore(args):
+    need_root()
+    import erisbackup as B
+    conf = E.load_conf()
+    to, only, yes, ref = "/", [], False, None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--to" and i + 1 < len(args):
+            to, i = args[i + 1], i + 1
+        elif a == "--only" and i + 1 < len(args):
+            only.append(args[i + 1])
+            i += 1
+        elif a in ("--yes", "-y"):
+            yes = True
+        elif a in ("-h", "--help"):
+            print("eris restore N|FILE [--to DIR] [--only PATH ...] [--yes]\n"
+                  "  N from 'eris backup list' (1 = newest). --to DIR extracts there instead of /;\n"
+                  "  --only restores just these paths (e.g. --only /etc/x-ui --only /var/lib/marzban).\n"
+                  "  Into /, a backup of the present state is made first, and the programs whose\n"
+                  "  databases come back (Marzban, x-ui, Jellyfin) are stopped and started again.")
+            return 0
+        else:
+            ref = a
+        i += 1
+    if ref is None:
+        print("usage: eris restore N|FILE [--to DIR] [--only PATH ...] [--yes]   (eris backup list)")
+        return 2
+    path = pick_archive(conf, ref)
+    m = B.manifest(path)
+    print("  %s: %s, %s, ERIS %s" % (os.path.basename(path), m["host"], m["time"], m["eris"]))
+    print("  into %s%s" % (to, (", only " + " ".join(only)) if only else ", everything"))
+    live = os.path.realpath(to) == "/"
+    if live and not yes:
+        a = ask("   overwrite the files on this server with the backup? type yes: ")
+        if a != "yes":
+            print("  nothing changed")
+            return 1
+    if live and conf["BACKUP_DIR"] and os.path.isdir(conf["BACKUP_DIR"]):
+        try:
+            before = B.make(conf["BACKUP_DIR"], int(conf["BACKUP_KEEP"]) + 1, conf["BACKUP_OWNER"],
+                            label="before-restore", log=lambda *_: None)
+            print("  the present state is saved first: %s" % before)
+        except Exception as e:
+            print(c(RED, "  could not save the present state first (%s); nothing changed" % e))
+            return 1
+    os.makedirs(to, exist_ok=True)
+    n, dbs = B.restore(path, to, only, log=print)
+    E.log("restore %s into %s (%d files, %d databases)" % (path, to, n, dbs))
+    print("  " + c(GREEN, "done: %d files, %d databases" % (n, dbs)))
+    return 0
+
+
+def backup_menu(conf):
+    print("   " + backup_summary(conf))
+    print("   %s back up now  %s list  %s folder  %s time  %s keep  %s owner" % (
+        c(CYAN, "1)"), c(CYAN, "2)"), c(CYAN, "3)"), c(CYAN, "4)"), c(CYAN, "5)"), c(CYAN, "6)")))
+    a = ask("   backup: ")
+    if a == "1":
+        cmd_backup(["now"])
+    elif a == "2":
+        cmd_backup(["list"])
+    elif a == "3":
+        v = ask("   folder (empty = keep, '-' = off) [%s]: " % (conf["BACKUP_DIR"] or "off"))
+        if v:
+            return set_setting("BACKUP_DIR", "" if v == "-" else v)
+    elif a == "4":
+        v = ask("   time HH:MM [%s]: " % conf["BACKUP_AT"])
+        return set_setting("BACKUP_AT", v) if v else None
+    elif a == "5":
+        v = ask("   backups to keep [%s]: " % conf["BACKUP_KEEP"])
+        return set_setting("BACKUP_KEEP", v) if v else None
+    elif a == "6":
+        v = ask("   owner user (empty = keep, '-' = root) [%s]: " % (conf["BACKUP_OWNER"] or "root"))
+        if v:
+            return set_setting("BACKUP_OWNER", "" if v == "-" else v)
+    return None
 
 
 # ---------------------------------------------------------------- update
@@ -715,9 +900,12 @@ def cmd_selftest():
     conf = E.load_conf()
     bad = [k for k in E.SETTINGS if not E.SETTINGS[k][2](conf[k])]
     check("settings valid", not bad, E.CONF + (" bad: %s" % bad if bad else ""))
-    for u in (LOOK_UNIT, UNIT, "eris-guard.service"):
+    for u in (LOOK_UNIT, UNIT, "eris-guard.service", "eris-backup.service", "eris-backup.timer"):
         r = sh("systemctl", "cat", u)
         check("unit installed", r.returncode == 0, u)
+    check("backup timer active", svc_state("eris-backup.timer") == "active", "eris-backup.timer")
+    if conf["BACKUP_DIR"]:
+        check("backup folder exists", os.path.isdir(conf["BACKUP_DIR"]), conf["BACKUP_DIR"])
     check("look unit enabled", svc_enabled(LOOK_UNIT) == "enabled", LOOK_UNIT)
     import erisfw as F
     if os.path.isfile(F.FW_CONF):
@@ -819,6 +1007,10 @@ def main(argv):
             return cmd_selftest()
         if cmd in ("update", "upgrade"):
             return cmd_update(args)
+        if cmd == "backup":
+            return cmd_backup(args)
+        if cmd == "restore":
+            return cmd_restore(args)
         if cmd in ("version", "--version"):
             print(E.VERSION)
             return 0
