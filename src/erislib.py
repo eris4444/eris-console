@@ -14,7 +14,7 @@ import subprocess
 import termios
 import time
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 REPO = os.environ.get("ERIS_REPO", "eris4444/eris-console")
 REPO_URL = "https://github.com/" + REPO
 RELEASES_API = "https://api.github.com/repos/%s/releases/latest" % REPO
@@ -54,6 +54,17 @@ SETTINGS = {
     "FULLSCREEN_APPS": ("", "extra program names separated by spaces",
                         lambda v: re.fullmatch(r"[A-Za-z0-9._+ -]*", v) is not None),
     "ERIS_GLYPHS": ("on", "on|off", lambda v: v in ("on", "off")),
+    "MARZBAN": ("auto", "auto|off", lambda v: v in ("auto", "off")),
+    "ALERTS": ("on", "on|off", lambda v: v in ("on", "off")),
+    "ALERT_CPU_TEMP": ("80", "50-105 (C)", lambda v: v.isdigit() and 50 <= int(v) <= 105),
+    "ALERT_DISK_TEMP": ("55", "35-80 (C)", lambda v: v.isdigit() and 35 <= int(v) <= 80),
+    "BACKUP_DIR": ("", "absolute folder path, empty = nightly backup off",
+                   lambda v: v == "" or (re.fullmatch(r"/[A-Za-z0-9._/+@-]*", v) is not None
+                                         and ".." not in v.split("/"))),
+    "BACKUP_KEEP": ("7", "1-90 backups", lambda v: v.isdigit() and 1 <= int(v) <= 90),
+    "BACKUP_AT": ("03:30", "HH:MM", lambda v: re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9]", v) is not None),
+    "BACKUP_OWNER": ("", "user that owns the backups (e.g. to read them over SMB), empty = root",
+                     lambda v: v == "" or re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", v) is not None),
 }
 
 COMMENTS = {
@@ -72,6 +83,14 @@ COMMENTS = {
     "CONSOLE_TTY": "the physical console used by ERIS",
     "FULLSCREEN_APPS": "extra full-screen programs; built in: vim nano htop top less man mc ncdu tmux watch ...",
     "ERIS_GLYPHS": "on = the console font gets the ERIS glyphs (Claude mascot, weather icons, sparklines, ➜)",
+    "MARZBAN": "Marzban panel (users, today's traffic, nodes) when /opt/marzban runs here; off = hidden",
+    "ALERTS": "red alert bar on the dashboard (heat, SMART, full disks, failed services, nodes, backups)",
+    "ALERT_CPU_TEMP": "alert when a CPU core reaches this temperature (C)",
+    "ALERT_DISK_TEMP": "alert when a disk reaches this temperature (C)",
+    "BACKUP_DIR": "nightly backup folder (eris backup), empty = off",
+    "BACKUP_KEEP": "how many backups to keep; older ones are deleted",
+    "BACKUP_AT": "time of the nightly backup",
+    "BACKUP_OWNER": "owner of the backup files (they stay readable only by this user), empty = root",
 }
 
 # ANSI order 0..15: black red green amber blue purple cyan white, then the bright set
