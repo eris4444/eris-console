@@ -9,7 +9,7 @@
 #   bash install-eris.sh --uninstall     remove everything (same as eris-uninstall)
 #   bash install-eris.sh --no-selftest   skip the checks at the end
 set -euo pipefail
-VERSION=2.2.0
+VERSION=2.3.0
 LOG=/var/log/eris-build.log
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/var/backups/eris/$TS
@@ -67,6 +67,7 @@ mkdir -p "$BK"
 for p in /root/.bashrc /root/.profile /etc/default/console-setup /etc/eris /usr/local/bin/eris /usr/local/lib/eris \
          /usr/local/sbin/eris-uninstall /etc/systemd/system/eris-console.service \
          /etc/systemd/system/eris-dashboard.service /etc/systemd/system/eris-guard.service \
+         /etc/systemd/system/eris-backup.service /etc/systemd/system/eris-backup.timer \
          /etc/sysctl.d/90-eris-console.conf /var/lib/eris/firewall.applied; do
   if [ -e "$p" ]; then
     mkdir -p "$BK$(dirname "$p")"
@@ -120,7 +121,16 @@ if [ -z "${SSH_CONNECTION-}" ] && [ -x /usr/local/bin/eris ]; then /usr/local/bi
 say "shell: ERIS blocks in /root/.bashrc and /root/.profile"
 
 # 6. services: the look unit now and at boot; the dashboard stays as it was (OFF on a fresh install)
+# nightly backup timer at BACKUP_AT (the backup itself does nothing while BACKUP_DIR is empty)
+python3 -c 'import sys; sys.path.insert(0, "/usr/local/lib/eris"); import erislib as E, erisbackup as B
+open("/etc/systemd/system/eris-backup.timer", "w").write(B.timer_text(E.load_conf()["BACKUP_AT"]))'
 systemctl daemon-reload
+systemctl enable --now eris-backup.timer > /dev/null 2>&1 || say "warning: eris-backup.timer did not start"
+if grep -q '^BACKUP_DIR="/' /etc/eris/eris.conf; then
+  say "backup: nightly at $(sed -n 's/^BACKUP_AT="\(.*\)"$/\1/p' /etc/eris/eris.conf) into $(sed -n 's/^BACKUP_DIR="\(.*\)"$/\1/p' /etc/eris/eris.conf)"
+else
+  say "backup: off until a folder is set (eris set BACKUP_DIR /path/to/folder)"
+fi
 systemctl enable eris-console.service > /dev/null 2>&1
 systemctl restart eris-console.service || say "warning: eris-console.service failed (journalctl -u eris-console)"
 if [ "$(sed -n 's/^DASH_AT_BOOT="\(.*\)"$/\1/p' /etc/eris/eris.conf)" = yes ]; then
@@ -147,6 +157,6 @@ rc=0
 if [ "$SELFTEST" = 1 ]; then
   /usr/local/bin/eris selftest || rc=$?
 fi
-say "done. Commands: eris (menu) | eris on | eris off | eris toggle | eris enable | eris disable | eris status | eris fw | eris update"
+say "done. Commands: eris (menu) | eris on | eris off | eris toggle | eris enable | eris disable | eris status | eris fw | eris backup | eris update"
 say "remove: eris-uninstall   (or: bash $0 --uninstall)"
 exit $rc
