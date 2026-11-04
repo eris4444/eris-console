@@ -12,7 +12,10 @@ A neon look for the physical console (tty1) of a headless Debian server, plus an
     - CPU, RAM, disks (SMART), network and temperatures, with history charts;
     - weather for the coming hours and days (Open-Meteo, no API key);
     - Claude and Codex plan usage: 5-hour and weekly windows with reset times;
+    - temperatures of the CPU and every disk: now, 24-hour min/max and a 24-hour chart (one column per minute, kept across restarts);
+    - Marzban, when it runs on the server: users, online users, today's traffic, live speed, Xray version and every node;
     - Clawd, a pixel mascot that walks around and reacts to load.
+  - An alert bar under the header: a hot CPU or disk, SMART failed or unreadable, a filesystem over 90%, a failed service, a Marzban node that is not connected, a backup that failed or is too old.
   - The dashboard uses the top part of tty1 (scroll region), so the shell below keeps working.
   - Full-screen programs (vim, htop, less, man, …) get the whole screen while they run.
   - Extra width or height spreads the text and grows the charts.
@@ -20,6 +23,9 @@ A neon look for the physical console (tty1) of a headless Debian server, plus an
   - One readable file, `/etc/eris/firewall.conf`: LAN networks, open ports with connection limits, allowed and blocked addresses.
   - Every change is checked with `nft -c`, backed up, and rolled back after 60 seconds unless you confirm it.
   - Localhost and SSH from the LAN always keep working. Only its own nftables table is touched, never Docker's.
+- **Backups (`eris backup`, nightly once a folder is set)**
+  - Settings and data of the server in one archive, with consistent copies of the live SQLite databases (Marzban, x-ui, Jellyfin).
+  - The newest `BACKUP_KEEP` archives are kept; `eris restore` puts one back (all of it, or only some paths).
 
 Everything is plain Python 3 and bash with no pip packages. The installer is one self-contained file.
 
@@ -53,6 +59,8 @@ eris font [list | set NAME|default | current]
 eris apply                re-apply the console look
 eris render [ROWSxCOLS] [utf8|safe|ascii]   print one dashboard frame here
 eris fw ...               the firewall (see below; eris fw help)
+eris backup [now|list|status|verify N]   a backup now, the list, the last result
+eris restore N|FILE [--to DIR] [--only PATH ...] [--yes]   put a backup back
 eris selftest             quick checks of the installed files
 eris update [--check]     install the latest release from this repository (settings stay)
 ```
@@ -69,6 +77,25 @@ Settings are in `/etc/eris/eris.conf`:
 | `KERNEL_MSGS` | whether kernel messages are hidden from the console |
 | `PROMPT_SCOPE` | `tty1` or `all` |
 | `ERIS_GLYPHS` | the extra font glyphs (mascot, weather icons, sparklines) |
+| `MARZBAN` | `auto` = Marzban panel when `/opt/marzban/.env` exists, `off` = hidden |
+| `ALERTS`, `ALERT_CPU_TEMP`, `ALERT_DISK_TEMP` | the alert bar on/off and its temperature limits (80 °C / 55 °C) |
+| `BACKUP_DIR`, `BACKUP_AT`, `BACKUP_KEEP`, `BACKUP_OWNER` | nightly backup folder (empty = off), time, how many to keep, owner of the files |
+
+### Backups
+`eris set BACKUP_DIR /srv/disk2/backups` turns the nightly backup on (`eris-backup.timer`, at `BACKUP_AT`).
+- **An archive** (`<host>-backup-YYYYmmdd-HHMM.tar`, mode 600) holds:
+  - `files.tar.gz`: the settings and data folders that exist on the server, such as `/etc/eris`, `/var/lib/marzban`, `/opt/marzban*`, `/etc/x-ui`, `/etc/xray-site`, `/root/.acme.sh`, `/appdata`, `/config/jellyfin`, `/etc/openmediavault`, `/etc/systemd/system`; caches and logs are left out;
+  - `databases/`: copies made with SQLite's own backup, checked with `integrity_check`;
+  - `manifest.json` and `RESTORE.txt`.
+- **Checks:** a `.sha256` file is written next to each archive, and the archive is read back after writing.
+- **Restore:** `eris restore 1` puts the newest backup back:
+  - first it backs up the present state (`…-before-restore.tar`);
+  - it stops Marzban, x-ui and Jellyfin while their databases come back, then starts them again;
+  - `--to DIR` only unpacks into a folder, and `--only /etc/x-ui` restores just that path.
+- **Secrets:** an archive holds passwords and private keys. `BACKUP_OWNER` gives the files to one user, for example to read them over SMB.
+
+### Marzban panel
+It logs in to `https://127.0.0.1:<UVICORN_PORT>` as the `.env` admin (`SUDO_USERNAME` / `SUDO_PASSWORD`) every 30 s and reads `/api/system`, `/api/nodes`, `/api/core` and today's `/api/nodes/usage`. Nothing is changed in Marzban.
 
 ### Claude / Codex usage panel
 - **Claude:** read-only, from Claude Code's own login (`/root/.claude/.credentials.json`). The token is never refreshed or changed.
