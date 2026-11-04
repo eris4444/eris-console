@@ -1353,7 +1353,7 @@ class TempHistory:
         for _, _, dd in self.points:
             for k in disks:
                 disks[k].append(dd.get(k))
-        return {"cpu": [p[1] for p in self.points], "disks": disks,
+        return {"t": [p[0] for p in self.points], "cpu": [p[1] for p in self.points], "disks": disks,
                 "span": (self.points[-1][0] - self.points[0][0]) if len(self.points) > 1 else 0}
 
 
@@ -2357,7 +2357,12 @@ def p_temps(d, wi, th, hi=None):
     series = [("CPU", th_.get("cpu") or [], 60, 80, "pink")]
     series += [(k, v, 45, 55, "cyan") for k, v in sorted(hist_disks.items())]
     L = []
+    times = th_.get("t") or []
     nw = max(len(s[0]) for s in series) + 1
+
+    def clock(i):
+        return time.strftime("%H:%M", time.localtime(times[i])) if 0 <= i < len(times) else ""
+
     for name, vals, warn, crit, col in series:
         v = [x for x in vals if x is not None]
         now = now_cpu if name == "CPU" else now_disk.get(name)
@@ -2365,26 +2370,55 @@ def p_temps(d, wi, th, hi=None):
             now = v[-1]
         ln = Ln(name.ljust(nw), col).add(ftemp(now, th), tcol(now, warn, crit))
         if v:
+            # when the peak was: the newest sample with the highest value
+            peak = max(v)
+            at = max(i for i, x in enumerate(vals) if x == peak)
             ln.gap().add("min ", "grey").add(ftemp(min(v), th), "text").gap().add("max ", "grey")
-            ln.add(ftemp(max(v), th), tcol(max(v), warn, crit))
+            ln.add(ftemp(peak, th), tcol(peak, warn, crit))
+            if len(times) == len(vals):
+                ln.add(" at " + clock(at), "grey")
         L.append(ln)
     span = th_.get("span") or 0
-    L.append(Ln("history", "grey").gap().add(fmt_dur(span) if span else "starts now", "text")
+    since = (" since " + clock(0)) if times and span else ""
+    L.append(Ln("history", "grey").gap().add((fmt_dur(span) + since) if span else "starts now", "text")
              .gap().add("1 min/col", "grey").section())
     spare = (hi or 0) - len(L)
     charts = [s for s in series if len([x for x in s[1] if x is not None]) >= 2]
-    if spare >= 4 and charts:
-        per = max(3, spare // len(charts))
+    if spare >= 5 and charts:
+        per = max(4, spare // len(charts))
         for name, vals, warn, crit, col in charts:
-            if spare < 4:
+            if spare < 5:
                 break
-            h = min(per, spare) - 1
-            lo, top = 20.0, max(crit + 10.0, max(x for x in vals if x is not None) + 5.0)
-            shifted = [None if x is None else max(0.0, x - lo) for x in vals]
+            h = min(per, spare) - 2                 # title row + time axis row
+            vv = vals[-wi:]
+            tt = times[-wi:] if len(times) == len(vals) else []
+            lo, top = 20.0, max(crit + 10.0, max(x for x in vv if x is not None) + 5.0)
+            # a missing sample (dashboard stopped) stays an empty column, so the time axis lines up
+            shifted = [0.0 if x is None else max(0.0, x - lo) for x in vv]
             L.append(Ln(name + " ", col).add("%s..%s" % (ftemp(lo, th), ftemp(top, th)), "grey").section())
             L += chart(shifted, wi, h, th, top - lo)
-            spare -= h + 1
+            L.append(time_axis(tt, wi))
+            spare -= h + 2
     return L
+
+
+def time_axis(tt, wi):
+    """Clock times under a chart whose columns are the samples tt (right-aligned like chart())."""
+    row = [" "] * wi
+    if tt:
+        pad = wi - len(tt)
+        step = max(8, wi // 6)
+        i = len(tt) - 1
+        while i >= 0:
+            lab = time.strftime("%H:%M", time.localtime(tt[i]))
+            end = pad + i + 1                        # the label ends under its column
+            start = end - len(lab)
+            if start < 0:
+                break
+            if all(c == " " for c in row[max(0, start - 1):end]):
+                row[start:end] = list(lab)
+            i -= step
+    return Ln("".join(row), "grey")
 
 
 def p_marzban(d, wi, th):

@@ -1,6 +1,7 @@
 # Changelog
 
 ## 2.5.0
+- Includes 2.4.1 (times on the temperature panel: when the peak was, a clock axis under the charts).
 - **Backups of each part.** Besides the full backup, every part of the server gets an archive of its own, in a folder of its own under `BACKUP_DIR`: `marzban`, `x-ui`, `xray-site`, `jellyfin`, `eris`, `claude-f-web`, `system`. A part that is not on the server is skipped. The list of parts is one dictionary (`PARTS` in `erisbackup.py`).
 - The full backup now lives in `BACKUP_DIR/full/` and never leaves the server. Archives of 2.4 in `BACKUP_DIR` move there once (on install, `eris backup now` or `eris backup list`).
 - New settings: `BACKUP_FULL` (on), `BACKUP_PARTS` (all, or a list), `BACKUP_PART_KEEP` (7). Old copies are removed per folder.
