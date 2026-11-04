@@ -9,7 +9,7 @@
 #   bash install-eris.sh --uninstall     remove everything (same as eris-uninstall)
 #   bash install-eris.sh --no-selftest   skip the checks at the end
 set -euo pipefail
-VERSION=2.3.0
+VERSION=2.4.0
 LOG=/var/log/eris-build.log
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/var/backups/eris/$TS
@@ -155,7 +155,7 @@ import subprocess
 import termios
 import time
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 REPO = os.environ.get("ERIS_REPO", "eris4444/eris-console")
 REPO_URL = "https://github.com/" + REPO
 RELEASES_API = "https://api.github.com/repos/%s/releases/latest" % REPO
@@ -177,6 +177,7 @@ FULLSCREEN_DEFAULT = ("vim vi nvim view vimdiff vim.basic vim.tiny nano pico ema
 # key: (default, validator description, validator)
 SETTINGS = {
     "DASH_HEIGHT": ("30", "15-70 (% of the console)", lambda v: v.isdigit() and 15 <= int(v) <= 70),
+    "DASH_MODE": ("split", "split|full", lambda v: v in ("split", "full")),
     "REFRESH": ("2", "1-30 seconds", lambda v: v.isdigit() and 1 <= int(v) <= 30),
     "WEATHER": ("on", "on|off", lambda v: v in ("on", "off")),
     "WEATHER_CITY": ("", "city name, empty = detect by IP",
@@ -210,6 +211,7 @@ SETTINGS = {
 
 COMMENTS = {
     "DASH_HEIGHT": "dashboard height in % of the console rows",
+    "DASH_MODE": "split = dashboard on top, shell below; full = the whole screen but 2 shell rows (eris full, Alt+F)",
     "REFRESH": "dashboard refresh interval in seconds",
     "WEATHER": "weather panel on|off (Open-Meteo, no API key)",
     "WEATHER_CITY": "empty = detect the city by IP",
@@ -1371,6 +1373,13 @@ class MarzbanStat(Worker):
                     self.token = None
             nodes = self.req(base, "/api/nodes") or []
             core = self.req(base, "/api/core") or {}
+            # Marzban's own online_users counts the last 24 hours; "connected now" = traffic in the last
+            # 2 minutes (online_at is set whenever a user's traffic is recorded, every few seconds)
+            now_names = []
+            for u in (self.req(base, "/api/users") or {}).get("users", []):
+                t = iso_epoch((u.get("online_at") or "") + "Z") if u.get("online_at") else None
+                if t is not None and time.time() - t <= 120:
+                    now_names.append(u.get("username") or "?")
             # today since local midnight; Marzban keeps UTC
             midnight = time.mktime(time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d"))
             start = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(midnight))
@@ -1380,6 +1389,7 @@ class MarzbanStat(Worker):
             self.snap = {"ok": True, "version": sysinfo.get("version"), "xray": core.get("version"),
                          "core_on": core.get("started"), "total": sysinfo.get("total_user", 0),
                          "active": sysinfo.get("users_active", 0), "online": sysinfo.get("online_users", 0),
+                         "now": sorted(now_names),
                          "limited": sysinfo.get("users_limited", 0), "expired": sysinfo.get("users_expired", 0),
                          "rx_rate": sysinfo.get("incoming_bandwidth_speed"), "tx_rate": sysinfo.get("outgoing_bandwidth_speed"),
                          "today_up": up, "today_down": down,
@@ -2329,10 +2339,15 @@ def p_marzban(d, wi, th):
     if not m.get("ok"):
         L = [Ln("N/A", "red"), Ln(th.clean(m.get("error", "")), "grey")]
     else:
-        L = [Ln("Xray ", "grey").add(m.get("xray") or "?", "white").gap().add("panel ", "grey")
-             .add(th.clean(m.get("version") or "?"), "text"),
+        now = m.get("now") or []
+        conn = Ln("connected now ", "grey").add(str(len(now)), "green" if now else "text")
+        if now:
+            conn.add("  " + ", ".join(th.clean(n) for n in now), "white")
+        L = [conn,
+             Ln("Xray ", "grey").add(m.get("xray") or "?", "white").gap().add("panel ", "grey")
+             .add(th.clean(m.get("version") or "?"), "text").section(),
              Ln("users ", "grey").add(str(m["active"]), "green").add("/%d active" % m["total"], "text").gap()
-             .add("online ", "grey").add(str(m["online"]), "white" if m["online"] else "text"),
+             .add("24h ", "grey").add(str(m["online"]), "white" if m["online"] else "text"),
              Ln("today ", "grey").add(g["down"] + E.human(m["today_down"]), "green").add("  ")
              .add(g["up"] + E.human(m["today_up"]), "pink").section()]
         if m.get("rx_rate") is not None:
@@ -2643,9 +2658,12 @@ def alert_bar(al, W, th, tick):
     return out.fit(W, th.g["ell"], spread=False)
 
 
-def dash_height(rows, pct):
+def dash_height(rows, pct, full=False):
+    """Dashboard rows; full screen leaves the shell its last 2 rows (a scroll region needs 2)."""
     if rows < 10:
         return 1 if rows >= 4 else 0
+    if full:
+        return rows - 2
     return max(3, min(int(round(rows * pct / 100.0)), rows - 6))
 
 
@@ -3204,7 +3222,7 @@ class Dashboard:
         return Theme(cs, cps)
 
     def height(self, rows):
-        return dash_height(rows, int(self.conf["DASH_HEIGHT"]))
+        return dash_height(rows, int(self.conf["DASH_HEIGHT"]), self.conf.get("DASH_MODE") == "full")
 
     def refresh(self):
         self.data = self.col.snapshot()
@@ -3330,7 +3348,7 @@ def render_cli(size, charset):
     d = col.snapshot()
     col.stop()
     th = Theme("utf8", extras=True) if charset == "eris" else Theme(charset)
-    H = dash_height(rows, int(conf["DASH_HEIGHT"]))
+    H = dash_height(rows, int(conf["DASH_HEIGHT"]), conf.get("DASH_MODE") == "full")
     for ln in render(d, cols, H, th, 0):
         sys.stdout.write(ln + "\n")
 
@@ -5628,6 +5646,7 @@ ERIS_EOF_fw_rollback
 
   eris                      settings menu
   eris on | off | toggle    start / stop the dashboard now
+  eris full [on|off|toggle] full screen dashboard (2 shell rows stay); Alt+F on the console does the same
   eris enable | disable     dashboard at boot (and start / stop it now)
   eris status               what is running and how the console is set up
   eris set KEY VALUE        change a setting (eris config lists them)
@@ -6069,7 +6088,7 @@ def set_setting(key, value):
     note = ""
     if key == "PROMPT_SCOPE":
         note = " (new shells; this one: source ~/.bashrc)"
-    elif key in ("DASH_HEIGHT", "REFRESH", "WEATHER", "WEATHER_CITY", "WEATHER_UNITS", "CHARSET", "FULLSCREEN_APPS",
+    elif key in ("DASH_HEIGHT", "DASH_MODE", "REFRESH", "WEATHER", "WEATHER_CITY", "WEATHER_UNITS", "CHARSET", "FULLSCREEN_APPS",
                  "MARZBAN", "ALERTS", "ALERT_CPU_TEMP", "ALERT_DISK_TEMP"):
         note = " (a running dashboard picks it up within a second)"
     elif key == "BACKUP_DIR" and value:
@@ -6115,7 +6134,8 @@ def menu():
               "      dashboard: %s, %s at boot" % (c(GREEN, "ON") if on else c(GREY, "OFF"),
                                                   "starts" if conf["DASH_AT_BOOT"] == "yes" else "not started"))
         items = [
-            ("1", "Dashboard height", "%s %%" % conf["DASH_HEIGHT"]),
+            ("1", "Dashboard height", "%s %%" % conf["DASH_HEIGHT"] + ("  (now full screen)" if conf["DASH_MODE"] == "full" else "")),
+            ("f", "Full screen (Alt+F)", "on" if conf["DASH_MODE"] == "full" else "off"),
             ("2", "Refresh interval", "%s s" % conf["REFRESH"]),
             ("3", "Weather", "%s  city: %s  units: %s" % (conf["WEATHER"], city, conf["WEATHER_UNITS"])),
             ("4", "Palette", conf["PALETTE"]),
@@ -6199,6 +6219,8 @@ def menu_item(ch, conf):
         return None
     if ch == "13":
         return backup_menu(conf)
+    if ch == "f":
+        return cmd_full(["toggle"], quiet=True)
     if ch == "s":
         cmd_on()
         return None
@@ -6241,6 +6263,27 @@ def font_menu(conf):
         if a.isdigit() and 1 <= int(a) <= len(table):
             return set_console_font(table[int(a) - 1][0]["name"])
         print("   unknown choice")
+
+
+# ---------------------------------------------------------------- full screen
+
+def cmd_full(args, quiet=False):
+    """Full screen dashboard on/off; turning it on also starts a stopped dashboard."""
+    need_root()
+    conf = E.load_conf()
+    want = (args[0] if args else "toggle").lower()
+    if want not in ("on", "off", "toggle"):
+        print("usage: eris full [on|off|toggle]")
+        return 2
+    full = conf["DASH_MODE"] != "full" if want == "toggle" else want == "on"
+    set_setting("DASH_MODE", "full" if full else "split")
+    if full and svc_state() != "active":
+        cmd_on()
+    msg = "full screen %s" % ("on (eris full off, or Alt+F, for the split view)" if full else "off: split view")
+    if quiet:
+        return msg
+    print(msg)
+    return 0
 
 
 # ---------------------------------------------------------------- backup
@@ -6632,6 +6675,9 @@ def main(argv):
             return cmd_selftest()
         if cmd in ("update", "upgrade"):
             return cmd_update(args)
+        if cmd in ("full", "fullscreen"):
+            r = cmd_full(args)
+            return r if isinstance(r, int) else 0
         if cmd == "backup":
             return cmd_backup(args)
         if cmd == "restore":
@@ -6764,6 +6810,12 @@ __eris_preexec() {
   : > "$__eris_handoff" 2> /dev/null
   printf '\033[?6l\033[r\033[0m\033[H\033[2J'
 }
+
+# Alt+F: dashboard full screen on/off (root only: eris changes /etc/eris/eris.conf).
+__eris_full() {
+  [ "$(id -u)" = 0 ] && command -v eris > /dev/null && eris full toggle > /dev/null 2>&1
+}
+bind -x '"\ef": __eris_full' 2> /dev/null
 
 # Run first so $? is still the last command's status; drop the hook of the previous ERIS version.
 if [ -z "$(trap -p DEBUG)" ]; then
