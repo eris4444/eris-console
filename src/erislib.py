@@ -14,7 +14,7 @@ import subprocess
 import termios
 import time
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 REPO = os.environ.get("ERIS_REPO", "eris4444/eris-console")
 REPO_URL = "https://github.com/" + REPO
 RELEASES_API = "https://api.github.com/repos/%s/releases/latest" % REPO
@@ -36,6 +36,7 @@ FULLSCREEN_DEFAULT = ("vim vi nvim view vimdiff vim.basic vim.tiny nano pico ema
 # key: (default, validator description, validator)
 SETTINGS = {
     "DASH_HEIGHT": ("30", "15-70 (% of the console)", lambda v: v.isdigit() and 15 <= int(v) <= 70),
+    "DASH_MODE": ("split", "split|full", lambda v: v in ("split", "full")),
     "REFRESH": ("2", "1-30 seconds", lambda v: v.isdigit() and 1 <= int(v) <= 30),
     "WEATHER": ("on", "on|off", lambda v: v in ("on", "off")),
     "WEATHER_CITY": ("", "city name, empty = detect by IP",
@@ -69,6 +70,7 @@ SETTINGS = {
 
 COMMENTS = {
     "DASH_HEIGHT": "dashboard height in % of the console rows",
+    "DASH_MODE": "split = dashboard on top, shell below; full = the whole screen but 2 shell rows (eris full, Alt+F)",
     "REFRESH": "dashboard refresh interval in seconds",
     "WEATHER": "weather panel on|off (Open-Meteo, no API key)",
     "WEATHER_CITY": "empty = detect the city by IP",
