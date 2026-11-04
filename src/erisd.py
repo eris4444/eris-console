@@ -613,6 +613,195 @@ class Services(Worker):
         return 10
 
 
+class TempHistory:
+    """CPU and disk temperatures once a minute for the last 24 hours, kept across restarts."""
+    PATH = os.path.join(E.STATE_DIR, "temps.json")
+    STEP, KEEP = 60, 1440
+
+    def __init__(self):
+        self.points = []          # [epoch, hottest CPU core, {disk: temp}]
+        self.next = 0
+        self.saved = time.time()
+        try:
+            with open(self.PATH) as f:
+                cut = time.time() - self.STEP * self.KEEP
+                self.points = [p for p in json.load(f) if isinstance(p, list) and len(p) == 3 and p[0] >= cut]
+        except (OSError, ValueError, TypeError):
+            self.points = []
+
+    def add(self, cpu, disks):
+        now = time.time()
+        if now < self.next:
+            return
+        self.next = now + self.STEP
+        self.points.append([int(now), cpu, {k: v for k, v in disks.items() if v is not None}])
+        del self.points[:-self.KEEP]
+        if now - self.saved >= 300:
+            self.save()
+
+    def save(self):
+        self.saved = time.time()
+        try:
+            os.makedirs(E.STATE_DIR, exist_ok=True)
+            tmp = self.PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.points, f, separators=(",", ":"))
+            os.replace(tmp, self.PATH)
+        except OSError:
+            pass
+
+    def series(self):
+        disks = {}
+        for _, _, dd in self.points:
+            for k in dd:
+                disks.setdefault(k, [])
+        for _, _, dd in self.points:
+            for k in disks:
+                disks[k].append(dd.get(k))
+        return {"cpu": [p[1] for p in self.points], "disks": disks,
+                "span": (self.points[-1][0] - self.points[0][0]) if len(self.points) > 1 else 0}
+
+
+def mz_env(path):
+    out = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
+class MarzbanStat(Worker):
+    """Users, today's traffic and nodes of the Marzban panel on this server (its admin from .env)."""
+    ENV = "/opt/marzban/.env"
+
+    def __init__(self, conf):
+        Worker.__init__(self, "marzban")
+        self.conf = conf
+        self.token = None
+        import ssl
+        import urllib.request
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                                  urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+
+    def req(self, base, path, form=None):
+        import urllib.parse
+        import urllib.request
+        headers = {"Accept": "application/json"}
+        body = None
+        if form is not None:
+            body = urllib.parse.urlencode(form).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if self.token and form is None:
+            headers["Authorization"] = "Bearer " + self.token
+        with self.opener.open(urllib.request.Request(base + path, data=body, headers=headers), timeout=15) as r:
+            return json.loads(r.read() or b"null")
+
+    def step(self):
+        if self.conf.get("MARZBAN") == "off" or not os.path.isfile(self.ENV):
+            self.snap = None
+            return 60
+        import urllib.error
+        e = mz_env(self.ENV)
+        base = "%s://127.0.0.1:%s" % ("https" if e.get("UVICORN_SSL_CERTFILE") else "http", e.get("UVICORN_PORT", "8000"))
+        try:
+            for attempt in (1, 2):
+                if not self.token:
+                    self.token = self.req(base, "/api/admin/token", form={
+                        "username": e.get("SUDO_USERNAME", ""), "password": e.get("SUDO_PASSWORD", "")})["access_token"]
+                try:
+                    sysinfo = self.req(base, "/api/system")
+                    break
+                except urllib.error.HTTPError as ex:
+                    if ex.code != 401 or attempt == 2:
+                        raise
+                    self.token = None
+            nodes = self.req(base, "/api/nodes") or []
+            core = self.req(base, "/api/core") or {}
+            # today since local midnight; Marzban keeps UTC
+            midnight = time.mktime(time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d"))
+            start = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(midnight))
+            usage = self.req(base, "/api/nodes/usage?start=" + start) or {}
+            up = sum(u.get("uplink") or 0 for u in usage.get("usages", []))
+            down = sum(u.get("downlink") or 0 for u in usage.get("usages", []))
+            self.snap = {"ok": True, "version": sysinfo.get("version"), "xray": core.get("version"),
+                         "core_on": core.get("started"), "total": sysinfo.get("total_user", 0),
+                         "active": sysinfo.get("users_active", 0), "online": sysinfo.get("online_users", 0),
+                         "limited": sysinfo.get("users_limited", 0), "expired": sysinfo.get("users_expired", 0),
+                         "rx_rate": sysinfo.get("incoming_bandwidth_speed"), "tx_rate": sysinfo.get("outgoing_bandwidth_speed"),
+                         "today_up": up, "today_down": down,
+                         "nodes": [{"name": n.get("name"), "status": n.get("status"), "xray": n.get("xray_version"),
+                                    "local": n.get("address") in ("127.0.0.1", "localhost", "::1"),
+                                    "message": n.get("message")} for n in nodes],
+                         "at": time.time()}
+        except Exception as ex:  # the panel restarting, a changed password, ...
+            self.token = None
+            msg = "HTTP %s" % ex.code if hasattr(ex, "code") else type(ex).__name__
+            self.snap = {"ok": False, "error": "no answer from %s (%s)" % (base, msg), "at": time.time(),
+                         "nodes": (self.snap or {}).get("nodes", [])}
+        return 30
+
+
+def read_backup_state():
+    try:
+        with open(os.path.join(E.STATE_DIR, "backup-state.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def alerts(d, conf):
+    """[(level, text)]: 2 = something is wrong now, 1 = look at it soon."""
+    out = []
+    lim_c, lim_d = int(conf.get("ALERT_CPU_TEMP", "80")), int(conf.get("ALERT_DISK_TEMP", "55"))
+    c = d.get("cpu") or {}
+    if c.get("hottest") is not None and c["hottest"] >= lim_c:
+        out.append((2, "CPU %.0fC" % c["hottest"]))
+    if c.get("throttle") == "THROTTLING":
+        out.append((1, "CPU throttling"))
+    for dk in (d.get("storage") or {}).get("phys", []):
+        t = dk.get("temp")
+        if t is not None and t >= lim_d:
+            out.append((2, "%s %.0fC" % (dk["name"], t)))
+        if dk.get("health") == "FAILED":
+            out.append((2, "%s SMART FAILED" % dk["name"]))
+        elif dk.get("note") == "SMART err":
+            out.append((1, "%s SMART unreadable" % dk["name"]))
+        for p in dk.get("parts", []):
+            mnt = next((m for m in p.get("mounts") or [] if m.startswith("/")), None)
+            if mnt and p.get("pct") is not None and p["pct"] >= 90:
+                out.append((2 if p["pct"] >= 95 else 1, "%s %d%% full" % (mnt, p["pct"])))
+    for s in d.get("svc") or []:
+        if s.get("state") == "failed":
+            out.append((2, "%s failed" % s["name"]))
+    m = d.get("mem") or {}
+    if (m.get("pct") or 0) >= 95 and (m.get("swap_pct") or 0) >= 80:
+        out.append((1, "memory full"))
+    mz = d.get("mz")
+    if mz:
+        if not mz.get("ok"):
+            out.append((1, "Marzban not answering"))
+        for n in mz.get("nodes", []):
+            if n.get("status") not in ("connected", "disabled", "connecting"):
+                out.append((2, "node %s %s" % (n.get("name"), n.get("status"))))
+    if conf.get("BACKUP_DIR"):
+        b = d.get("backup") or {}
+        last = b.get("last_ok_epoch")
+        if b.get("last_error_epoch", 0) > (last or 0):
+            out.append((2, "backup failed"))
+        elif not last:
+            out.append((1, "no backup yet"))
+        elif time.time() - last > 36 * 3600:
+            out.append((1, "backup %dd old" % ((time.time() - last) // 86400 or 1)))
+        if not os.path.isdir(conf["BACKUP_DIR"]):
+            out.append((2, "backup folder missing"))
+    return sorted(out, key=lambda x: -x[0])
+
+
 WMO = {0: "Clear", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast", 45: "Fog", 48: "Rime fog",
        51: "Light drizzle", 53: "Drizzle", 55: "Dense drizzle", 56: "Freezing drizzle", 57: "Freezing drizzle",
        61: "Light rain", 63: "Rain", 65: "Heavy rain", 66: "Freezing rain", 67: "Freezing rain",
@@ -928,6 +1117,8 @@ STY = {
     "cyan": "\x1b[0;1;36m", "dcyan": "\x1b[0;36m", "amber": "\x1b[0;33m", "yellow": "\x1b[0;1;33m",
     "white": "\x1b[0;1;37m", "text": "\x1b[0;37m", "grey": "\x1b[0;1;30m",
     "clawd": "\x1b[0;33m",          # palette slot 3 = Claude orange #d97757 in the ERIS palette
+    "alert": "\x1b[0;1;37;41m",     # white on red: the alert bar's label
+    "warn": "\x1b[0;30;43m",        # black on amber: the label when only warnings are left
     "gap": "",
 }
 GLYPHS = {
@@ -1439,6 +1630,83 @@ def p_svc(d, wi, th):
     return L
 
 
+def p_temps(d, wi, th, hi=None):
+    """Now, 24 h min/max and (tall panels) a chart for the CPU and every disk with a sensor."""
+    th_ = d.get("temps") or {}
+    now_cpu = (d.get("cpu") or {}).get("hottest")
+    now_disk = {dk["name"]: dk.get("temp") for dk in (d.get("storage") or {}).get("phys", [])}
+    hist_disks = dict(th_.get("disks") or {})
+    for k, v in now_disk.items():
+        if v is not None:
+            hist_disks.setdefault(k, [])            # a disk with a sensor shows before its history starts
+    series = [("CPU", th_.get("cpu") or [], 60, 80, "pink")]
+    series += [(k, v, 45, 55, "cyan") for k, v in sorted(hist_disks.items())]
+    L = []
+    nw = max(len(s[0]) for s in series) + 1
+    for name, vals, warn, crit, col in series:
+        v = [x for x in vals if x is not None]
+        now = now_cpu if name == "CPU" else now_disk.get(name)
+        if now is None and v:
+            now = v[-1]
+        ln = Ln(name.ljust(nw), col).add(ftemp(now, th), tcol(now, warn, crit))
+        if v:
+            ln.gap().add("min ", "grey").add(ftemp(min(v), th), "text").gap().add("max ", "grey")
+            ln.add(ftemp(max(v), th), tcol(max(v), warn, crit))
+        L.append(ln)
+    span = th_.get("span") or 0
+    L.append(Ln("history", "grey").gap().add(fmt_dur(span) if span else "starts now", "text")
+             .gap().add("1 min/col", "grey").section())
+    spare = (hi or 0) - len(L)
+    charts = [s for s in series if len([x for x in s[1] if x is not None]) >= 2]
+    if spare >= 4 and charts:
+        per = max(3, spare // len(charts))
+        for name, vals, warn, crit, col in charts:
+            if spare < 4:
+                break
+            h = min(per, spare) - 1
+            lo, top = 20.0, max(crit + 10.0, max(x for x in vals if x is not None) + 5.0)
+            shifted = [None if x is None else max(0.0, x - lo) for x in vals]
+            L.append(Ln(name + " ", col).add("%s..%s" % (ftemp(lo, th), ftemp(top, th)), "grey").section())
+            L += chart(shifted, wi, h, th, top - lo)
+            spare -= h + 1
+    return L
+
+
+def p_marzban(d, wi, th):
+    m = d.get("mz")
+    g = th.g
+    if not m:
+        return [Ln("checking...", "grey")]
+    if not m.get("ok"):
+        L = [Ln("N/A", "red"), Ln(th.clean(m.get("error", "")), "grey")]
+    else:
+        L = [Ln("Xray ", "grey").add(m.get("xray") or "?", "white").gap().add("panel ", "grey")
+             .add(th.clean(m.get("version") or "?"), "text"),
+             Ln("users ", "grey").add(str(m["active"]), "green").add("/%d active" % m["total"], "text").gap()
+             .add("online ", "grey").add(str(m["online"]), "white" if m["online"] else "text"),
+             Ln("today ", "grey").add(g["down"] + E.human(m["today_down"]), "green").add("  ")
+             .add(g["up"] + E.human(m["today_up"]), "pink").section()]
+        if m.get("rx_rate") is not None:
+            L.append(Ln("now   ", "grey").add(g["down"] + rate(m["rx_rate"]), "text").add("  ")
+                     .add(g["up"] + rate(m["tx_rate"]), "text"))
+        if m.get("expired") or m.get("limited"):
+            L.append(Ln("expired ", "grey").add(str(m.get("expired", 0)), "amber").gap()
+                     .add("limited ", "grey").add(str(m.get("limited", 0)), "amber"))
+    nodes = m.get("nodes") or []
+    if nodes:
+        nw = max(len(n["name"] or "") for n in nodes)
+        for i, n in enumerate(nodes):
+            st = n.get("status") or "?"
+            col = "green" if st == "connected" else "amber" if st in ("connecting", "disabled") else "red"
+            ln = Ln(g["dot"] + " ", col).add(th.clean(n["name"] or "?").ljust(nw), "text").gap().add(st, col)
+            if n.get("xray"):
+                ln.gap().add(n["xray"], "grey")
+            L.append(ln.section() if i == 0 else ln)
+    elif m.get("ok"):
+        L.append(Ln("no nodes", "grey").section())
+    return L
+
+
 def storage_lines(d, wi, th):
     st = d["storage"]
     if not st:
@@ -1542,11 +1810,13 @@ PANELS = {
     "weather": ("WEATHER", "amber", 36, 3.4, p_weather),
     "sys": ("SYSTEM", "red", 28, 2.4, p_sys),
     "svc": ("SERVICES", "yellow", 24, 2.6, p_svc),
+    "temps": ("TEMPERATURES", "amber", 28, 2.4, p_temps),
+    "marzban": ("MARZBAN", "purple", 30, 2.6, p_marzban),
 }
-PRIO = ["cpu", "usage", "mem", "storage", "net", "gpu", "weather", "sys", "svc"]
-CHARTED = ("cpu", "mem", "net")
-GROUPS = [["cpu", "svc"], ["usage", "mem"], ["storage"], ["net", "gpu"], ["weather"], ["sys"]]
-FLEX = ("gpu", "weather", "sys", "svc", "net", "mem")
+PRIO = ["cpu", "usage", "mem", "storage", "marzban", "net", "temps", "gpu", "weather", "sys", "svc"]
+CHARTED = ("cpu", "mem", "net", "temps")
+GROUPS = [["cpu", "svc"], ["usage", "mem"], ["storage", "temps"], ["marzban", "net", "gpu"], ["weather"], ["sys"]]
+FLEX = ("gpu", "weather", "sys", "svc", "net", "mem", "temps", "marzban")
 
 
 def spread_rows(lines, hi):
@@ -1709,6 +1979,21 @@ def header_lines(d, W, th, logo):
     return rows, ((W - stage_w, stage_w) if stage_w else None)
 
 
+def alert_bar(al, W, th, tick):
+    """One row: ' ALERT 3 ' label, then the messages (red = now, amber = soon); long lists rotate."""
+    red = any(lv == 2 for lv, _ in al)
+    head = Ln(" %s %d " % ("ALERT" if red else "WARNING", len(al)), "alert" if red else "warn").add(" ")
+    sep = " %s " % th.g["sep"]
+    start = (tick // 3) % len(al)
+    order = al[start:] + al[:start] if sum(len(t) + len(sep) for _, t in al) > W - head.n else al
+    out = Ln().cat(head)
+    for i, (lv, text) in enumerate(order):
+        if i:
+            out.add(sep, "grey")
+        out.add(th.clean(text), "red" if lv == 2 else "amber")
+    return out.fit(W, th.g["ell"], spread=False)
+
+
 def dash_height(rows, pct):
     if rows < 10:
         return 1 if rows >= 4 else 0
@@ -1724,8 +2009,13 @@ def render_parts(d, W, H, th, tick):
     head = head[:H]
     Hp = H - len(head)
     rows = [ln if stage else ln.fit(W) for ln in head]
+    al = d.get("alerts") or []
+    if al and Hp >= 5:
+        rows.append(alert_bar(al, W, th, tick))
+        Hp -= 1
     if Hp >= 3:
-        enabled = [p for p in PRIO if not (p == "weather" and d.get("weather_off")) and not (p == "gpu" and not d["gpu"])]
+        enabled = [p for p in PRIO if not (p == "weather" and d.get("weather_off")) and not (p == "gpu" and not d["gpu"])
+                   and not (p == "marzban" and not d.get("mz"))]
         cache = {}
 
         def content(p, w):
@@ -1932,8 +2222,10 @@ class Collector:
         self.services = Services()
         self.weather = Weather(conf)
         self.usage = Usage()
-        for t in (self.storage, self.services, self.weather, self.usage):
+        self.marzban = MarzbanStat(conf)
+        for t in (self.storage, self.services, self.weather, self.usage, self.marzban):
             t.start()
+        self.temps = TempHistory()
         osr = {}
         for line in (rd("/etc/os-release", "") or "").splitlines():
             k, _, v = line.partition("=")
@@ -1947,8 +2239,9 @@ class Collector:
         self.hist = {k: collections.deque(maxlen=720) for k in ("cpu", "mem", "rx", "tx")}
 
     def stop(self):
-        for t in (self.storage, self.services, self.weather, self.usage):
+        for t in (self.storage, self.services, self.weather, self.usage, self.marzban):
             t.stop()
+        self.temps.save()
 
     def snapshot(self):
         def safe(fn, default=None):
@@ -1973,7 +2266,9 @@ class Collector:
         if net:
             self.hist["rx"].append(net.get("rx_rate"))
             self.hist["tx"].append(net.get("tx_rate"))
-        return {
+        if cpu.get("hottest") is not None or st:
+            self.temps.add(cpu.get("hottest"), {dk["name"]: dk.get("temp") for dk in (st or {}).get("phys", [])})
+        d = {
             "disk_io": io_per,
             "hist": {k: list(v) for k, v in self.hist.items()},
             "cpu": cpu,
@@ -1990,7 +2285,12 @@ class Collector:
                     "procs": sum(1 for p in os.listdir("/proc") if p.isdigit()),
                     "io": io_total,
                     "refreshed": time.strftime("%H:%M:%S"), "every": self.conf.get("REFRESH", "2")},
+            "temps": self.temps.series(),
+            "mz": self.marzban.snap,
+            "backup": read_backup_state(),
         }
+        d["alerts"] = safe(lambda: alerts(d, self.conf), []) if self.conf.get("ALERTS", "on") == "on" else []
+        return d
 
 
 # ================================================================ console driver
@@ -2374,7 +2674,9 @@ def render_cli(size, charset):
     deadline = time.time() + 40
     while time.time() < deadline and (col.storage.snap is None or col.services.snap is None
                                       or col.storage.next_smart == 0
-                                      or (conf["WEATHER"] == "on" and col.weather.snap is None)):
+                                      or (conf["WEATHER"] == "on" and col.weather.snap is None)
+                                      or (conf["MARZBAN"] != "off" and os.path.isfile(MarzbanStat.ENV)
+                                          and col.marzban.snap is None)):
         time.sleep(0.5)
     d = col.snapshot()
     col.stop()
