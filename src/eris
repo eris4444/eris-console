@@ -3,6 +3,7 @@
 
   eris                      settings menu
   eris on | off | toggle    start / stop the dashboard now
+  eris full [on|off|toggle] full screen dashboard (2 shell rows stay); Alt+F on the console does the same
   eris enable | disable     dashboard at boot (and start / stop it now)
   eris status               what is running and how the console is set up
   eris set KEY VALUE        change a setting (eris config lists them)
@@ -444,7 +445,7 @@ def set_setting(key, value):
     note = ""
     if key == "PROMPT_SCOPE":
         note = " (new shells; this one: source ~/.bashrc)"
-    elif key in ("DASH_HEIGHT", "REFRESH", "WEATHER", "WEATHER_CITY", "WEATHER_UNITS", "CHARSET", "FULLSCREEN_APPS",
+    elif key in ("DASH_HEIGHT", "DASH_MODE", "REFRESH", "WEATHER", "WEATHER_CITY", "WEATHER_UNITS", "CHARSET", "FULLSCREEN_APPS",
                  "MARZBAN", "ALERTS", "ALERT_CPU_TEMP", "ALERT_DISK_TEMP"):
         note = " (a running dashboard picks it up within a second)"
     elif key == "BACKUP_DIR" and value:
@@ -490,7 +491,8 @@ def menu():
               "      dashboard: %s, %s at boot" % (c(GREEN, "ON") if on else c(GREY, "OFF"),
                                                   "starts" if conf["DASH_AT_BOOT"] == "yes" else "not started"))
         items = [
-            ("1", "Dashboard height", "%s %%" % conf["DASH_HEIGHT"]),
+            ("1", "Dashboard height", "%s %%" % conf["DASH_HEIGHT"] + ("  (now full screen)" if conf["DASH_MODE"] == "full" else "")),
+            ("f", "Full screen (Alt+F)", "on" if conf["DASH_MODE"] == "full" else "off"),
             ("2", "Refresh interval", "%s s" % conf["REFRESH"]),
             ("3", "Weather", "%s  city: %s  units: %s" % (conf["WEATHER"], city, conf["WEATHER_UNITS"])),
             ("4", "Palette", conf["PALETTE"]),
@@ -574,6 +576,8 @@ def menu_item(ch, conf):
         return None
     if ch == "13":
         return backup_menu(conf)
+    if ch == "f":
+        return cmd_full(["toggle"], quiet=True)
     if ch == "s":
         cmd_on()
         return None
@@ -616,6 +620,27 @@ def font_menu(conf):
         if a.isdigit() and 1 <= int(a) <= len(table):
             return set_console_font(table[int(a) - 1][0]["name"])
         print("   unknown choice")
+
+
+# ---------------------------------------------------------------- full screen
+
+def cmd_full(args, quiet=False):
+    """Full screen dashboard on/off; turning it on also starts a stopped dashboard."""
+    need_root()
+    conf = E.load_conf()
+    want = (args[0] if args else "toggle").lower()
+    if want not in ("on", "off", "toggle"):
+        print("usage: eris full [on|off|toggle]")
+        return 2
+    full = conf["DASH_MODE"] != "full" if want == "toggle" else want == "on"
+    set_setting("DASH_MODE", "full" if full else "split")
+    if full and svc_state() != "active":
+        cmd_on()
+    msg = "full screen %s" % ("on (eris full off, or Alt+F, for the split view)" if full else "off: split view")
+    if quiet:
+        return msg
+    print(msg)
+    return 0
 
 
 # ---------------------------------------------------------------- backup
@@ -1007,6 +1032,9 @@ def main(argv):
             return cmd_selftest()
         if cmd in ("update", "upgrade"):
             return cmd_update(args)
+        if cmd in ("full", "fullscreen"):
+            r = cmd_full(args)
+            return r if isinstance(r, int) else 0
         if cmd == "backup":
             return cmd_backup(args)
         if cmd == "restore":
