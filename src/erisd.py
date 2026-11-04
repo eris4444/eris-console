@@ -722,6 +722,13 @@ class MarzbanStat(Worker):
                     self.token = None
             nodes = self.req(base, "/api/nodes") or []
             core = self.req(base, "/api/core") or {}
+            # Marzban's own online_users counts the last 24 hours; "connected now" = traffic in the last
+            # 2 minutes (online_at is set whenever a user's traffic is recorded, every few seconds)
+            now_names = []
+            for u in (self.req(base, "/api/users") or {}).get("users", []):
+                t = iso_epoch((u.get("online_at") or "") + "Z") if u.get("online_at") else None
+                if t is not None and time.time() - t <= 120:
+                    now_names.append(u.get("username") or "?")
             # today since local midnight; Marzban keeps UTC
             midnight = time.mktime(time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d"))
             start = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(midnight))
@@ -731,6 +738,7 @@ class MarzbanStat(Worker):
             self.snap = {"ok": True, "version": sysinfo.get("version"), "xray": core.get("version"),
                          "core_on": core.get("started"), "total": sysinfo.get("total_user", 0),
                          "active": sysinfo.get("users_active", 0), "online": sysinfo.get("online_users", 0),
+                         "now": sorted(now_names),
                          "limited": sysinfo.get("users_limited", 0), "expired": sysinfo.get("users_expired", 0),
                          "rx_rate": sysinfo.get("incoming_bandwidth_speed"), "tx_rate": sysinfo.get("outgoing_bandwidth_speed"),
                          "today_up": up, "today_down": down,
@@ -1680,10 +1688,15 @@ def p_marzban(d, wi, th):
     if not m.get("ok"):
         L = [Ln("N/A", "red"), Ln(th.clean(m.get("error", "")), "grey")]
     else:
-        L = [Ln("Xray ", "grey").add(m.get("xray") or "?", "white").gap().add("panel ", "grey")
-             .add(th.clean(m.get("version") or "?"), "text"),
+        now = m.get("now") or []
+        conn = Ln("connected now ", "grey").add(str(len(now)), "green" if now else "text")
+        if now:
+            conn.add("  " + ", ".join(th.clean(n) for n in now), "white")
+        L = [conn,
+             Ln("Xray ", "grey").add(m.get("xray") or "?", "white").gap().add("panel ", "grey")
+             .add(th.clean(m.get("version") or "?"), "text").section(),
              Ln("users ", "grey").add(str(m["active"]), "green").add("/%d active" % m["total"], "text").gap()
-             .add("online ", "grey").add(str(m["online"]), "white" if m["online"] else "text"),
+             .add("24h ", "grey").add(str(m["online"]), "white" if m["online"] else "text"),
              Ln("today ", "grey").add(g["down"] + E.human(m["today_down"]), "green").add("  ")
              .add(g["up"] + E.human(m["today_up"]), "pink").section()]
         if m.get("rx_rate") is not None:
@@ -1994,9 +2007,12 @@ def alert_bar(al, W, th, tick):
     return out.fit(W, th.g["ell"], spread=False)
 
 
-def dash_height(rows, pct):
+def dash_height(rows, pct, full=False):
+    """Dashboard rows; full screen leaves the shell its last 2 rows (a scroll region needs 2)."""
     if rows < 10:
         return 1 if rows >= 4 else 0
+    if full:
+        return rows - 2
     return max(3, min(int(round(rows * pct / 100.0)), rows - 6))
 
 
@@ -2555,7 +2571,7 @@ class Dashboard:
         return Theme(cs, cps)
 
     def height(self, rows):
-        return dash_height(rows, int(self.conf["DASH_HEIGHT"]))
+        return dash_height(rows, int(self.conf["DASH_HEIGHT"]), self.conf.get("DASH_MODE") == "full")
 
     def refresh(self):
         self.data = self.col.snapshot()
@@ -2681,7 +2697,7 @@ def render_cli(size, charset):
     d = col.snapshot()
     col.stop()
     th = Theme("utf8", extras=True) if charset == "eris" else Theme(charset)
-    H = dash_height(rows, int(conf["DASH_HEIGHT"]))
+    H = dash_height(rows, int(conf["DASH_HEIGHT"]), conf.get("DASH_MODE") == "full")
     for ln in render(d, cols, H, th, 0):
         sys.stdout.write(ln + "\n")
 
