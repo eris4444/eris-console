@@ -113,6 +113,12 @@ __eris_preexec() {
   printf '\033[?6l\033[r\033[0m\033[H\033[2J'
 }
 
+# Alt+F: dashboard full screen on/off (root only: eris changes /etc/eris/eris.conf).
+__eris_full() {
+  [ "$(id -u)" = 0 ] && command -v eris > /dev/null && eris full toggle > /dev/null 2>&1
+}
+bind -x '"\ef": __eris_full' 2> /dev/null
+
 # Run first so $? is still the last command's status; drop the hook of the previous ERIS version.
 if [ -z "$(trap -p DEBUG)" ]; then
   trap '__eris_preexec' DEBUG
