@@ -21,6 +21,12 @@ for u in eris-dashboard.service eris-console.service; do
   fi
 done
 
+# 1a. the nightly backup timer (the backups themselves stay in BACKUP_DIR)
+if systemctl cat eris-backup.timer > /dev/null 2>&1; then
+  timeout 30 systemctl disable --now eris-backup.timer > /dev/null 2>&1
+  say "stopped and disabled eris-backup.timer (backups made so far stay where they are)"
+fi
+
 # 1b. firewall: only ERIS's own nftables table goes (Docker's tables are not touched)
 for u in eris-fw-rollback eris-fw-auto-on; do
   systemctl stop "$u.service" > /dev/null 2>&1
@@ -90,6 +96,7 @@ done
 # 6. files
 for f in /etc/systemd/system/eris-dashboard.service /etc/systemd/system/eris-console.service \
          /etc/systemd/system/eris-guard.service \
+         /etc/systemd/system/eris-backup.service /etc/systemd/system/eris-backup.timer \
          /usr/local/bin/eris /usr/local/lib/eris /etc/eris /run/eris "$ST"; do
   if [ -e "$f" ]; then
     rm -rf "$f"
