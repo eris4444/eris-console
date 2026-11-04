@@ -1,0 +1,10 @@
+[Unit]
+Description=ERIS backup of the settings and databases (eris backup)
+After=local-fs.target docker.service
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+# --if-set: does nothing while BACKUP_DIR is empty
+ExecStart=/usr/local/bin/eris backup now --quiet --if-set
