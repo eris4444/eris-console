@@ -9,4 +9,5 @@
 - `eris backup encrypt FILE --password-file F` / `eris backup decrypt`: AES-256-CBC, PBKDF2 with 200000 rounds and a salt (openssl; the password is read from a file, so `ps` never shows it).
 - `backup-state.json` has a `parts` entry for each part; the keys at the top keep meaning the full backup, so the dashboard and its alerts work as before. The alert bar also shows a failed part (`backup marzban failed`).
 - Menu item 13 (backup) has the new options.
+- The dashboard collectors no longer stop when a `/sys` folder is missing (containers).
 - `ERIS_ROOT` moves every path under another folder, for tests. Unit tests and a real install in a systemd container run on GitHub Actions (debian:trixie).

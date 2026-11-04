@@ -21,7 +21,7 @@ jobs:
           apt-get update -q
           DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
             python3 shellcheck openssl ca-certificates git
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build install-eris.sh
         run: bash src/build.sh /tmp/install-eris.sh
       - name: The committed install-eris.sh is the built one
@@ -49,7 +49,7 @@ jobs:
       matrix:
         mode: [fresh, upgrade]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: install-eris.sh in debian:trixie with systemd
         run: bash tests/ci-install.sh ${{ matrix.mode }}
 
@@ -61,7 +61,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build and check the version
         run: |
           bash src/build.sh "$PWD/install-eris.sh"

@@ -41,6 +41,14 @@ def rd(path, default=None):
         return default
 
 
+def ls(path):
+    """os.listdir, or [] when the folder is not there (containers, other kernels)."""
+    try:
+        return os.listdir(path)
+    except OSError:
+        return []
+
+
 def rint(path):
     v = rd(path)
     try:
@@ -99,14 +107,14 @@ class Cpu:
                 self.model = re.sub(r"\s+", " ", v.strip())
                 break
         cores = set()
-        for d in sorted(os.listdir("/sys/devices/system/cpu")):
+        for d in sorted(ls("/sys/devices/system/cpu")):
             if re.fullmatch(r"cpu\d+", d) and os.path.exists("/sys/devices/system/cpu/%s/topology" % d):
                 t = "/sys/devices/system/cpu/%s/topology/" % d
                 self.core_of[int(d[3:])] = rint(t + "core_id")
                 cores.add((rint(t + "physical_package_id"), rint(t + "core_id")))
         self.threads = len(self.core_of) or os.cpu_count() or 1
         self.cores = len(cores) or self.threads
-        for h in sorted(os.listdir("/sys/class/hwmon")):
+        for h in sorted(ls("/sys/class/hwmon")):
             if rd("/sys/class/hwmon/%s/name" % h) in ("coretemp", "k10temp", "zenpower", "cpu_thermal"):
                 self.hwmon = "/sys/class/hwmon/" + h
                 break
@@ -240,7 +248,7 @@ class Gpu:
                     vendor = parts[1].replace(" Corporation", "").replace(" Technologies Inc.", "")
                     name = "%s %s" % (vendor.split()[0] if vendor else "", parts[2])
             hw = None
-            for h in os.listdir("/sys/class/hwmon"):
+            for h in ls("/sys/class/hwmon"):
                 if os.path.realpath("/sys/class/hwmon/%s/device" % h) == path:
                     hw = "/sys/class/hwmon/" + h
             vram = None
@@ -264,7 +272,7 @@ class Gpu:
             util = rint(d["path"] + "/gpu_busy_percent")
             vram_used = rint(d["path"] + "/mem_info_vram_used")
             dpms = None
-            for c in os.listdir("/sys/class/drm"):
+            for c in ls("/sys/class/drm"):
                 if re.fullmatch(r"card\d+-.+", c) and rd("/sys/class/drm/%s/status" % c) == "connected" \
                         and os.path.realpath("/sys/class/drm/%s/device" % c.split("-")[0]) == d["path"]:
                     dpms = "%s %s" % (c.split("-", 1)[1], rd("/sys/class/drm/%s/dpms" % c, "?"))
@@ -305,7 +313,7 @@ class Net:
     def sample(self):
         ifname, gw = self.default_route()
         if not ifname:
-            for n in sorted(os.listdir("/sys/class/net")):
+            for n in sorted(ls("/sys/class/net")):
                 if n != "lo" and rd("/sys/class/net/%s/operstate" % n) == "up":
                     ifname = n
                     break
@@ -328,7 +336,7 @@ class Net:
                 ip6 = ":".join(p[0][i:i + 4] for i in range(0, 32, 4))
                 break
         drv = os.path.basename(os.path.realpath(b + "device/driver")) if os.path.exists(b + "device/driver") else None
-        others = [n for n in sorted(os.listdir("/sys/class/net")) if n not in ("lo", ifname)
+        others = [n for n in sorted(ls("/sys/class/net")) if n not in ("lo", ifname)
                   and rd("/sys/class/net/%s/operstate" % n) == "up"]
         return {"if": ifname, "gw": gw, "ip": self.ipv4(ifname), "ip6": ip6, "state": rd(b + "operstate", "?"),
                 "carrier": rint(b + "carrier"), "speed": speed if speed and speed > 0 else None,
@@ -455,7 +463,7 @@ class Storage(Worker):
 
     @staticmethod
     def drivetemp(name):
-        for h in os.listdir("/sys/class/hwmon"):
+        for h in ls("/sys/class/hwmon"):
             if rd("/sys/class/hwmon/%s/name" % h) == "drivetemp":
                 blk = "/sys/class/hwmon/%s/device/block/%s" % (h, name)
                 if os.path.exists(blk):
