@@ -9,7 +9,7 @@
 #   bash install-eris.sh --uninstall     remove everything (same as eris-uninstall)
 #   bash install-eris.sh --no-selftest   skip the checks at the end
 set -euo pipefail
-VERSION=2.4.1
+VERSION=2.5.1
 LOG=/var/log/eris-build.log
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/var/backups/eris/$TS
@@ -127,7 +127,11 @@ open("/etc/systemd/system/eris-backup.timer", "w").write(B.timer_text(E.load_con
 systemctl daemon-reload
 systemctl enable --now eris-backup.timer > /dev/null 2>&1 || say "warning: eris-backup.timer did not start"
 if grep -q '^BACKUP_DIR="/' /etc/eris/eris.conf; then
-  say "backup: nightly at $(sed -n 's/^BACKUP_AT="\(.*\)"$/\1/p' /etc/eris/eris.conf) into $(sed -n 's/^BACKUP_DIR="\(.*\)"$/\1/p' /etc/eris/eris.conf)"
+  say "backup: nightly at $(sed -n 's/^BACKUP_AT="\(.*\)"$/\1/p' /etc/eris/eris.conf) into $(sed -n 's/^BACKUP_DIR="\(.*\)"$/\1/p' /etc/eris/eris.conf) (full/ and one folder per part)"
+  # 2.5: the archives of 2.4 move from BACKUP_DIR into BACKUP_DIR/full (once; nothing to do afterwards)
+  python3 -c 'import sys; sys.path.insert(0, "/usr/local/lib/eris"); import erislib as E, erisbackup as B
+c = E.load_conf(); B.migrate(c["BACKUP_DIR"], c["BACKUP_OWNER"], log=lambda m: print("[ERIS] backup:" + m))' \
+    || say "warning: the older backups were not moved into full/ (eris backup list does it later)"
 else
   say "backup: off until a folder is set (eris set BACKUP_DIR /path/to/folder)"
 fi

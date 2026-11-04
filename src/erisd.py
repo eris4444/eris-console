@@ -41,6 +41,14 @@ def rd(path, default=None):
         return default
 
 
+def ls(path):
+    """os.listdir, or [] when the folder is not there (containers, other kernels)."""
+    try:
+        return os.listdir(path)
+    except OSError:
+        return []
+
+
 def rint(path):
     v = rd(path)
     try:
@@ -99,14 +107,14 @@ class Cpu:
                 self.model = re.sub(r"\s+", " ", v.strip())
                 break
         cores = set()
-        for d in sorted(os.listdir("/sys/devices/system/cpu")):
+        for d in sorted(ls("/sys/devices/system/cpu")):
             if re.fullmatch(r"cpu\d+", d) and os.path.exists("/sys/devices/system/cpu/%s/topology" % d):
                 t = "/sys/devices/system/cpu/%s/topology/" % d
                 self.core_of[int(d[3:])] = rint(t + "core_id")
                 cores.add((rint(t + "physical_package_id"), rint(t + "core_id")))
         self.threads = len(self.core_of) or os.cpu_count() or 1
         self.cores = len(cores) or self.threads
-        for h in sorted(os.listdir("/sys/class/hwmon")):
+        for h in sorted(ls("/sys/class/hwmon")):
             if rd("/sys/class/hwmon/%s/name" % h) in ("coretemp", "k10temp", "zenpower", "cpu_thermal"):
                 self.hwmon = "/sys/class/hwmon/" + h
                 break
@@ -240,7 +248,7 @@ class Gpu:
                     vendor = parts[1].replace(" Corporation", "").replace(" Technologies Inc.", "")
                     name = "%s %s" % (vendor.split()[0] if vendor else "", parts[2])
             hw = None
-            for h in os.listdir("/sys/class/hwmon"):
+            for h in ls("/sys/class/hwmon"):
                 if os.path.realpath("/sys/class/hwmon/%s/device" % h) == path:
                     hw = "/sys/class/hwmon/" + h
             vram = None
@@ -264,7 +272,7 @@ class Gpu:
             util = rint(d["path"] + "/gpu_busy_percent")
             vram_used = rint(d["path"] + "/mem_info_vram_used")
             dpms = None
-            for c in os.listdir("/sys/class/drm"):
+            for c in ls("/sys/class/drm"):
                 if re.fullmatch(r"card\d+-.+", c) and rd("/sys/class/drm/%s/status" % c) == "connected" \
                         and os.path.realpath("/sys/class/drm/%s/device" % c.split("-")[0]) == d["path"]:
                     dpms = "%s %s" % (c.split("-", 1)[1], rd("/sys/class/drm/%s/dpms" % c, "?"))
@@ -305,7 +313,7 @@ class Net:
     def sample(self):
         ifname, gw = self.default_route()
         if not ifname:
-            for n in sorted(os.listdir("/sys/class/net")):
+            for n in sorted(ls("/sys/class/net")):
                 if n != "lo" and rd("/sys/class/net/%s/operstate" % n) == "up":
                     ifname = n
                     break
@@ -328,7 +336,7 @@ class Net:
                 ip6 = ":".join(p[0][i:i + 4] for i in range(0, 32, 4))
                 break
         drv = os.path.basename(os.path.realpath(b + "device/driver")) if os.path.exists(b + "device/driver") else None
-        others = [n for n in sorted(os.listdir("/sys/class/net")) if n not in ("lo", ifname)
+        others = [n for n in sorted(ls("/sys/class/net")) if n not in ("lo", ifname)
                   and rd("/sys/class/net/%s/operstate" % n) == "up"]
         return {"if": ifname, "gw": gw, "ip": self.ipv4(ifname), "ip6": ip6, "state": rd(b + "operstate", "?"),
                 "carrier": rint(b + "carrier"), "speed": speed if speed and speed > 0 else None,
@@ -455,7 +463,7 @@ class Storage(Worker):
 
     @staticmethod
     def drivetemp(name):
-        for h in os.listdir("/sys/class/hwmon"):
+        for h in ls("/sys/class/hwmon"):
             if rd("/sys/class/hwmon/%s/name" % h) == "drivetemp":
                 blk = "/sys/class/hwmon/%s/device/block/%s" % (h, name)
                 if os.path.exists(blk):
@@ -798,13 +806,25 @@ def alerts(d, conf):
                 out.append((2, "node %s %s" % (n.get("name"), n.get("status"))))
     if conf.get("BACKUP_DIR"):
         b = d.get("backup") or {}
-        last = b.get("last_ok_epoch")
-        if b.get("last_error_epoch", 0) > (last or 0):
-            out.append((2, "backup failed"))
+        parts = {k: v for k, v in (b.get("parts") or {}).items()
+                 if isinstance(v, dict) and k in E.parts_setting(conf.get("BACKUP_PARTS", "all"))}
+        failed = False
+        if conf.get("BACKUP_FULL", "on") == "on":
+            last = b.get("last_ok_epoch")
+            failed = b.get("last_error_epoch", 0) > (last or 0)
+            if failed:
+                out.append((2, "backup failed"))
+        else:   # only parts: the age of the newest part backup
+            last = max([p.get("last_ok_epoch") or 0 for p in parts.values()] or [0]) or None
+        if failed:
+            pass
         elif not last:
             out.append((1, "no backup yet"))
         elif time.time() - last > 36 * 3600:
             out.append((1, "backup %dd old" % ((time.time() - last) // 86400 or 1)))
+        for name, p in sorted(parts.items()):
+            if p.get("last_error_epoch", 0) > (p.get("last_ok_epoch") or 0):
+                out.append((2, "backup %s failed" % name))
         if not os.path.isdir(conf["BACKUP_DIR"]):
             out.append((2, "backup folder missing"))
     return sorted(out, key=lambda x: -x[0])
@@ -1339,7 +1359,7 @@ def p_cpu(d, wi, th, hi=None):
     st = c["throttle"]
     L.append(Ln("Throttle", "grey").gap().add(st, "red" if st == "THROTTLING" else "green" if st == "OK" else "amber")
              .add(" (%s events)" % ("N/A" if c["throttle_count"] is None else c["throttle_count"]), "grey"))
-    return with_chart(L, d, "cpu", wi, hi, th, "CPU usage", 100.0, lambda v: "%.0f%%" % v)
+    return pct_chart(L, d, "cpu", wi, hi, th, "CPU usage", lambda v: "%.0f%%" % v)
 
 
 def p_mem(d, wi, th, hi=None):
@@ -1353,7 +1373,7 @@ def p_mem(d, wi, th, hi=None):
         Ln("Swap ", "grey").cat(bar(m["swap_pct"], bw, th)).add(" " + pct_s(m["swap_pct"]), "white").section(),
         Ln("used ", "grey").add(E.human(m["swap_used"]), "white").gap().add("of " + E.human(m["swap_total"]), "text"),
     ]
-    return with_chart(L, d, "mem", wi, hi, th, "RAM used", 100.0, lambda v: "%.0f%%" % v)
+    return pct_chart(L, d, "mem", wi, hi, th, "RAM used", lambda v: "%.0f%%" % v, warn=70, crit=90)
 
 
 def chart(vals, w, h, th, vmax=None, style=None):
@@ -1683,16 +1703,117 @@ def p_temps(d, wi, th, hi=None):
             if spare < 5:
                 break
             h = min(per, spare) - 2                 # title row + time axis row
-            vv = vals[-wi:]
-            tt = times[-wi:] if len(times) == len(vals) else []
-            lo, top = 20.0, max(crit + 10.0, max(x for x in vv if x is not None) + 5.0)
-            # a missing sample (dashboard stopped) stays an empty column, so the time axis lines up
-            shifted = [0.0 if x is None else max(0.0, x - lo) for x in vv]
-            L.append(Ln(name + " ", col).add("%s..%s" % (ftemp(lo, th), ftemp(top, th)), "grey").section())
-            L += chart(shifted, wi, h, th, top - lo)
-            L.append(time_axis(tt, wi))
+            gw = 5                                    # left gutter with the temperature of each line
+            vv = vals[-(wi - gw):]
+            tt = times[-(wi - gw):] if len(times) == len(vals) else []
+            shown = [x for x in vv if x is not None]
+            if not shown:                             # nothing recorded in the visible window
+                continue
+            lo, top = fit_scale(min(shown), max(shown), crit + 5.0, h)
+            L.append(Ln(name + " ", col).add("%s..%s" % (ftemp(lo, th), ftemp(top, th)), "grey")
+                     .gap().add("lines: ", "grey").add("%d" % warn + th.g["deg"], "amber").add(" warm  ", "grey")
+                     .add("%d" % crit + th.g["deg"], "red").add(" hot", "grey").section())
+            L += guide_chart(vv, wi, gw, h, th, lo, top, warn, crit, th.g["deg"], 10)
+            L.append(Ln(" " * gw).cat(time_axis(tt, wi - gw)))
             spare -= h + 2
     return L
+
+
+def fit_scale(vmin, vmax, need, h):
+    """(lo, top) for a chart of h rows where every row is 2.5, 5, 10 or 20 degrees and lo is a multiple
+    of 5, so the guide lines (multiples of 5) fall exactly on row edges. top covers `need` and vmax."""
+    need = max(need, vmax + 2.0)
+    lo_hi = max(0, int(vmin // 5) * 5)
+    for rs in (2.5, 5.0, 10.0, 20.0):
+        lo = lo_hi
+        while lo >= 0:
+            if lo + rs * h >= need:
+                return float(lo), lo + rs * h
+            lo -= 5
+    return 0.0, need
+
+
+def guide_chart(vals, wi, gw, h, th, lo, top, warn, crit, unit, step):
+    """h rows: a gutter of gw columns with the value of each horizontal guide line, then the bars.
+
+    Bars are green below `warn`, amber below `crit`, red above (by the row they stand in). Guide lines:
+    amber = warn, red = crit, grey = every `step`. A line runs along the bottom edge of its row, so data
+    above it reaches over the line (a bar covers it) and data below it leaves the line visible: a value
+    of 31 with a line at 30 always shows above the line. A missing sample is an empty column, so a clock
+    under the chart still lines up."""
+    wc = wi - gw
+    vals = vals[-wc:]
+    span = max(1.0, top - lo)
+
+    def row_of(t):
+        """Row whose bottom edge is nearest to value t: the guide line is drawn along that edge, so a
+        bar that is higher than t always reaches above the line (None = at the chart's floor)."""
+        k = int(round((t - lo) / span * h))
+        return None if k < 1 else h - 1 - min(k, h - 1)
+
+    labels = {}                                      # row -> (value, style)
+    first = int(lo // step + 1) * step
+    cands = [(crit, "dred"), (warn, "amber")] + [(float(t), "grey") for t in range(first, int(top), step)
+                                                  if t not in (int(warn), int(crit))]
+    for i, (t, st) in enumerate(cands):
+        if not lo < t < top:
+            continue
+        r = row_of(t)
+        if r is None or r in labels or (i >= 2 and (r - 1 in labels or r + 1 in labels)):
+            continue
+        labels[r] = (t, st)
+    low_line = "▁" if th.spark else (th.g["track"] if th.cs != "ascii" else "_")
+    levels = [None if v is None else int(round(max(0.0, min(1.0, (v - lo) / span)) * h * 8)) for v in vals]
+    pad = wc - len(levels)
+    out = []
+    for r in range(h):
+        base = (h - 1 - r) * 8
+        mid = lo + span * ((h - r) - 0.5) / h        # value at the middle of this row
+        bar = "red" if mid >= crit else "amber" if mid >= warn else "green"
+        ln = Ln()
+        guide = labels.get(r)
+        if guide:
+            ln.add(("%d" % guide[0] + unit).rjust(gw - 1) + " ", "red" if guide[1] == "dred" else guide[1])
+        else:
+            ln.add(" " * gw)
+        line_st = None if not guide else guide[1]
+        for i in range(wc):
+            lv = levels[i - pad] if i >= pad else None
+            f = 0 if lv is None else max(0, min(8, lv - base))
+            if f == 8:
+                ln.add(th.g["full"], bar)
+            elif f > 0 and th.spark:
+                ln.add(SPARK[f - 1], bar)
+            elif f >= 4:
+                ln.add(th.g["full"], bar)
+            elif line_st:
+                ln.add(low_line, line_st)            # the guide line, along the bottom edge of its row
+            else:
+                ln.add(" ")
+        out.append(ln)
+    return out
+
+
+def pct_chart(L, d, key, wi, hi, th, title, fmt, warn=60, crit=80):
+    """Usage chart (0-100 %) with guide lines: the history of `key` in the spare rows of a panel.
+
+    The rows are 5, 10 or 20 % each when the panel has 20, 10 or 5+ spare rows (then every guide line is
+    exact); other heights stretch 0-100 % over the rows and a line can be off by up to half a row."""
+    spare_rows = (hi or 0) - len(L) - 2
+    for exact in (20, 10, 5):
+        if spare_rows >= exact:
+            hi = len(L) + 2 + exact
+            break
+    hist = (d.get("hist") or {}).get(key) or []
+    spare = (hi or 0) - len(L) - 2
+    if spare < 3 or len(hist) < 2:
+        return L
+    every = (d.get("sys") or {}).get("every", "2")
+    peak = max((v for v in hist if v is not None), default=0)
+    gw = 5
+    L.append(Ln(title, "grey").gap().add("peak " + fmt(peak), "text").gap().add("%ss/col" % every, "grey")
+             .gap().add("%d%%" % warn, "amber").add(" ", "grey").add("%d%%" % crit, "red").section())
+    return L + guide_chart(hist[-(wi - gw):], wi, gw, spare, th, 0.0, 100.0, warn, crit, "%", 25)
 
 
 def time_axis(tt, wi):

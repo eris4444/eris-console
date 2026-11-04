@@ -1,0 +1,10 @@
+# A Debian trixie container that boots systemd, for the real install test (tests/ci-install.sh).
+ARG BASE=debian:trixie
+FROM ${BASE}
+ENV container=docker
+RUN apt-get update -q \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+      systemd systemd-sysv dbus python3 ca-certificates curl openssl \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
