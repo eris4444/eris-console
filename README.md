@@ -13,12 +13,13 @@ A neon look for the physical console (tty1) of a headless Debian server, plus an
     - weather for the coming hours and days (Open-Meteo, no API key);
     - Claude and Codex plan usage: 5-hour and weekly windows with reset times;
     - temperatures of the CPU and every disk: now, 24-hour min/max and a 24-hour chart (one column per minute, kept across restarts);
-    - Marzban, when it runs on the server: users, online users, today's traffic, live speed, Xray version and every node;
+    - Marzban, when it runs on the server: the users connected right now (traffic in the last 2 minutes) with their names, users online in 24 h, today's traffic, live speed, Xray version and every node;
     - Clawd, a pixel mascot that walks around and reacts to load.
   - An alert bar under the header: a hot CPU or disk, SMART failed or unreadable, a filesystem over 90%, a failed service, a Marzban node that is not connected, a backup that failed or is too old.
   - The dashboard uses the top part of tty1 (scroll region), so the shell below keeps working.
   - Full-screen programs (vim, htop, less, man, …) get the whole screen while they run.
   - Extra width or height spreads the text and grows the charts.
+  - Full screen: `eris full` (or **Alt+F** at the console prompt) gives the dashboard the whole screen but the last 2 rows, where the shell stays; again for the split view.
 - **Firewall (`eris fw`, optional, OFF unless you set it up)**
   - One readable file, `/etc/eris/firewall.conf`: LAN networks, open ports with connection limits, allowed and blocked addresses.
   - Every change is checked with `nft -c`, backed up, and rolled back after 60 seconds unless you confirm it.
@@ -52,6 +53,7 @@ An upgrade never reloads or restarts an existing firewall. An older hand-written
 ```
 eris                      settings menu
 eris on | off | toggle    start / stop the dashboard now
+eris full [on|off|toggle] full screen dashboard (Alt+F at the console prompt)
 eris enable | disable     dashboard at boot (and start / stop it now)
 eris status               what is running and how the console is set up
 eris set KEY VALUE        change a setting (eris config lists them)
@@ -70,6 +72,7 @@ Settings are in `/etc/eris/eris.conf`:
 | Setting | What it controls |
 | --- | --- |
 | `DASH_HEIGHT` | dashboard height, in % of the rows |
+| `DASH_MODE` | `split` (dashboard on top, shell below) or `full` (all rows but 2) |
 | `REFRESH` | refresh interval |
 | `WEATHER`, `WEATHER_CITY`, `WEATHER_UNITS` | weather panel on/off, the city (empty = detect by IP), C or F |
 | `PALETTE` | `neon` or `default` |
