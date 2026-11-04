@@ -14,7 +14,7 @@ import subprocess
 import termios
 import time
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 REPO = os.environ.get("ERIS_REPO", "eris4444/eris-console")
 REPO_URL = "https://github.com/" + REPO
 RELEASES_API = "https://api.github.com/repos/%s/releases/latest" % REPO
