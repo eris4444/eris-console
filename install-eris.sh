@@ -9,7 +9,7 @@
 #   bash install-eris.sh --uninstall     remove everything (same as eris-uninstall)
 #   bash install-eris.sh --no-selftest   skip the checks at the end
 set -euo pipefail
-VERSION=2.2.0
+VERSION=2.3.0
 LOG=/var/log/eris-build.log
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/var/backups/eris/$TS
@@ -48,6 +48,12 @@ for u in eris-dashboard.service eris-console.service; do
     say "stopped and disabled $u"
   fi
 done
+
+# 1a. the nightly backup timer (the backups themselves stay in BACKUP_DIR)
+if systemctl cat eris-backup.timer > /dev/null 2>&1; then
+  timeout 30 systemctl disable --now eris-backup.timer > /dev/null 2>&1
+  say "stopped and disabled eris-backup.timer (backups made so far stay where they are)"
+fi
 
 # 1b. firewall: only ERIS's own nftables table goes (Docker's tables are not touched)
 for u in eris-fw-rollback eris-fw-auto-on; do
@@ -118,6 +124,7 @@ done
 # 6. files
 for f in /etc/systemd/system/eris-dashboard.service /etc/systemd/system/eris-console.service \
          /etc/systemd/system/eris-guard.service \
+         /etc/systemd/system/eris-backup.service /etc/systemd/system/eris-backup.timer \
          /usr/local/bin/eris /usr/local/lib/eris /etc/eris /run/eris "$ST"; do
   if [ -e "$f" ]; then
     rm -rf "$f"
@@ -148,7 +155,7 @@ import subprocess
 import termios
 import time
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 REPO = os.environ.get("ERIS_REPO", "eris4444/eris-console")
 REPO_URL = "https://github.com/" + REPO
 RELEASES_API = "https://api.github.com/repos/%s/releases/latest" % REPO
@@ -188,6 +195,17 @@ SETTINGS = {
     "FULLSCREEN_APPS": ("", "extra program names separated by spaces",
                         lambda v: re.fullmatch(r"[A-Za-z0-9._+ -]*", v) is not None),
     "ERIS_GLYPHS": ("on", "on|off", lambda v: v in ("on", "off")),
+    "MARZBAN": ("auto", "auto|off", lambda v: v in ("auto", "off")),
+    "ALERTS": ("on", "on|off", lambda v: v in ("on", "off")),
+    "ALERT_CPU_TEMP": ("80", "50-105 (C)", lambda v: v.isdigit() and 50 <= int(v) <= 105),
+    "ALERT_DISK_TEMP": ("55", "35-80 (C)", lambda v: v.isdigit() and 35 <= int(v) <= 80),
+    "BACKUP_DIR": ("", "absolute folder path, empty = nightly backup off",
+                   lambda v: v == "" or (re.fullmatch(r"/[A-Za-z0-9._/+@-]*", v) is not None
+                                         and ".." not in v.split("/"))),
+    "BACKUP_KEEP": ("7", "1-90 backups", lambda v: v.isdigit() and 1 <= int(v) <= 90),
+    "BACKUP_AT": ("03:30", "HH:MM", lambda v: re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9]", v) is not None),
+    "BACKUP_OWNER": ("", "user that owns the backups (e.g. to read them over SMB), empty = root",
+                     lambda v: v == "" or re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", v) is not None),
 }
 
 COMMENTS = {
@@ -206,6 +224,14 @@ COMMENTS = {
     "CONSOLE_TTY": "the physical console used by ERIS",
     "FULLSCREEN_APPS": "extra full-screen programs; built in: vim nano htop top less man mc ncdu tmux watch ...",
     "ERIS_GLYPHS": "on = the console font gets the ERIS glyphs (Claude mascot, weather icons, sparklines, ➜)",
+    "MARZBAN": "Marzban panel (users, today's traffic, nodes) when /opt/marzban runs here; off = hidden",
+    "ALERTS": "red alert bar on the dashboard (heat, SMART, full disks, failed services, nodes, backups)",
+    "ALERT_CPU_TEMP": "alert when a CPU core reaches this temperature (C)",
+    "ALERT_DISK_TEMP": "alert when a disk reaches this temperature (C)",
+    "BACKUP_DIR": "nightly backup folder (eris backup), empty = off",
+    "BACKUP_KEEP": "how many backups to keep; older ones are deleted",
+    "BACKUP_AT": "time of the nightly backup",
+    "BACKUP_OWNER": "owner of the backup files (they stay readable only by this user), empty = root",
 }
 
 # ANSI order 0..15: black red green amber blue purple cyan white, then the bright set
@@ -1236,6 +1262,195 @@ class Services(Worker):
         return 10
 
 
+class TempHistory:
+    """CPU and disk temperatures once a minute for the last 24 hours, kept across restarts."""
+    PATH = os.path.join(E.STATE_DIR, "temps.json")
+    STEP, KEEP = 60, 1440
+
+    def __init__(self):
+        self.points = []          # [epoch, hottest CPU core, {disk: temp}]
+        self.next = 0
+        self.saved = time.time()
+        try:
+            with open(self.PATH) as f:
+                cut = time.time() - self.STEP * self.KEEP
+                self.points = [p for p in json.load(f) if isinstance(p, list) and len(p) == 3 and p[0] >= cut]
+        except (OSError, ValueError, TypeError):
+            self.points = []
+
+    def add(self, cpu, disks):
+        now = time.time()
+        if now < self.next:
+            return
+        self.next = now + self.STEP
+        self.points.append([int(now), cpu, {k: v for k, v in disks.items() if v is not None}])
+        del self.points[:-self.KEEP]
+        if now - self.saved >= 300:
+            self.save()
+
+    def save(self):
+        self.saved = time.time()
+        try:
+            os.makedirs(E.STATE_DIR, exist_ok=True)
+            tmp = self.PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.points, f, separators=(",", ":"))
+            os.replace(tmp, self.PATH)
+        except OSError:
+            pass
+
+    def series(self):
+        disks = {}
+        for _, _, dd in self.points:
+            for k in dd:
+                disks.setdefault(k, [])
+        for _, _, dd in self.points:
+            for k in disks:
+                disks[k].append(dd.get(k))
+        return {"cpu": [p[1] for p in self.points], "disks": disks,
+                "span": (self.points[-1][0] - self.points[0][0]) if len(self.points) > 1 else 0}
+
+
+def mz_env(path):
+    out = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
+class MarzbanStat(Worker):
+    """Users, today's traffic and nodes of the Marzban panel on this server (its admin from .env)."""
+    ENV = "/opt/marzban/.env"
+
+    def __init__(self, conf):
+        Worker.__init__(self, "marzban")
+        self.conf = conf
+        self.token = None
+        import ssl
+        import urllib.request
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                                  urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+
+    def req(self, base, path, form=None):
+        import urllib.parse
+        import urllib.request
+        headers = {"Accept": "application/json"}
+        body = None
+        if form is not None:
+            body = urllib.parse.urlencode(form).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if self.token and form is None:
+            headers["Authorization"] = "Bearer " + self.token
+        with self.opener.open(urllib.request.Request(base + path, data=body, headers=headers), timeout=15) as r:
+            return json.loads(r.read() or b"null")
+
+    def step(self):
+        if self.conf.get("MARZBAN") == "off" or not os.path.isfile(self.ENV):
+            self.snap = None
+            return 60
+        import urllib.error
+        e = mz_env(self.ENV)
+        base = "%s://127.0.0.1:%s" % ("https" if e.get("UVICORN_SSL_CERTFILE") else "http", e.get("UVICORN_PORT", "8000"))
+        try:
+            for attempt in (1, 2):
+                if not self.token:
+                    self.token = self.req(base, "/api/admin/token", form={
+                        "username": e.get("SUDO_USERNAME", ""), "password": e.get("SUDO_PASSWORD", "")})["access_token"]
+                try:
+                    sysinfo = self.req(base, "/api/system")
+                    break
+                except urllib.error.HTTPError as ex:
+                    if ex.code != 401 or attempt == 2:
+                        raise
+                    self.token = None
+            nodes = self.req(base, "/api/nodes") or []
+            core = self.req(base, "/api/core") or {}
+            # today since local midnight; Marzban keeps UTC
+            midnight = time.mktime(time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d"))
+            start = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(midnight))
+            usage = self.req(base, "/api/nodes/usage?start=" + start) or {}
+            up = sum(u.get("uplink") or 0 for u in usage.get("usages", []))
+            down = sum(u.get("downlink") or 0 for u in usage.get("usages", []))
+            self.snap = {"ok": True, "version": sysinfo.get("version"), "xray": core.get("version"),
+                         "core_on": core.get("started"), "total": sysinfo.get("total_user", 0),
+                         "active": sysinfo.get("users_active", 0), "online": sysinfo.get("online_users", 0),
+                         "limited": sysinfo.get("users_limited", 0), "expired": sysinfo.get("users_expired", 0),
+                         "rx_rate": sysinfo.get("incoming_bandwidth_speed"), "tx_rate": sysinfo.get("outgoing_bandwidth_speed"),
+                         "today_up": up, "today_down": down,
+                         "nodes": [{"name": n.get("name"), "status": n.get("status"), "xray": n.get("xray_version"),
+                                    "local": n.get("address") in ("127.0.0.1", "localhost", "::1"),
+                                    "message": n.get("message")} for n in nodes],
+                         "at": time.time()}
+        except Exception as ex:  # the panel restarting, a changed password, ...
+            self.token = None
+            msg = "HTTP %s" % ex.code if hasattr(ex, "code") else type(ex).__name__
+            self.snap = {"ok": False, "error": "no answer from %s (%s)" % (base, msg), "at": time.time(),
+                         "nodes": (self.snap or {}).get("nodes", [])}
+        return 30
+
+
+def read_backup_state():
+    try:
+        with open(os.path.join(E.STATE_DIR, "backup-state.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def alerts(d, conf):
+    """[(level, text)]: 2 = something is wrong now, 1 = look at it soon."""
+    out = []
+    lim_c, lim_d = int(conf.get("ALERT_CPU_TEMP", "80")), int(conf.get("ALERT_DISK_TEMP", "55"))
+    c = d.get("cpu") or {}
+    if c.get("hottest") is not None and c["hottest"] >= lim_c:
+        out.append((2, "CPU %.0fC" % c["hottest"]))
+    if c.get("throttle") == "THROTTLING":
+        out.append((1, "CPU throttling"))
+    for dk in (d.get("storage") or {}).get("phys", []):
+        t = dk.get("temp")
+        if t is not None and t >= lim_d:
+            out.append((2, "%s %.0fC" % (dk["name"], t)))
+        if dk.get("health") == "FAILED":
+            out.append((2, "%s SMART FAILED" % dk["name"]))
+        elif dk.get("note") == "SMART err":
+            out.append((1, "%s SMART unreadable" % dk["name"]))
+        for p in dk.get("parts", []):
+            mnt = next((m for m in p.get("mounts") or [] if m.startswith("/")), None)
+            if mnt and p.get("pct") is not None and p["pct"] >= 90:
+                out.append((2 if p["pct"] >= 95 else 1, "%s %d%% full" % (mnt, p["pct"])))
+    for s in d.get("svc") or []:
+        if s.get("state") == "failed":
+            out.append((2, "%s failed" % s["name"]))
+    m = d.get("mem") or {}
+    if (m.get("pct") or 0) >= 95 and (m.get("swap_pct") or 0) >= 80:
+        out.append((1, "memory full"))
+    mz = d.get("mz")
+    if mz:
+        if not mz.get("ok"):
+            out.append((1, "Marzban not answering"))
+        for n in mz.get("nodes", []):
+            if n.get("status") not in ("connected", "disabled", "connecting"):
+                out.append((2, "node %s %s" % (n.get("name"), n.get("status"))))
+    if conf.get("BACKUP_DIR"):
+        b = d.get("backup") or {}
+        last = b.get("last_ok_epoch")
+        if b.get("last_error_epoch", 0) > (last or 0):
+            out.append((2, "backup failed"))
+        elif not last:
+            out.append((1, "no backup yet"))
+        elif time.time() - last > 36 * 3600:
+            out.append((1, "backup %dd old" % ((time.time() - last) // 86400 or 1)))
+        if not os.path.isdir(conf["BACKUP_DIR"]):
+            out.append((2, "backup folder missing"))
+    return sorted(out, key=lambda x: -x[0])
+
+
 WMO = {0: "Clear", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast", 45: "Fog", 48: "Rime fog",
        51: "Light drizzle", 53: "Drizzle", 55: "Dense drizzle", 56: "Freezing drizzle", 57: "Freezing drizzle",
        61: "Light rain", 63: "Rain", 65: "Heavy rain", 66: "Freezing rain", 67: "Freezing rain",
@@ -1551,6 +1766,8 @@ STY = {
     "cyan": "\x1b[0;1;36m", "dcyan": "\x1b[0;36m", "amber": "\x1b[0;33m", "yellow": "\x1b[0;1;33m",
     "white": "\x1b[0;1;37m", "text": "\x1b[0;37m", "grey": "\x1b[0;1;30m",
     "clawd": "\x1b[0;33m",          # palette slot 3 = Claude orange #d97757 in the ERIS palette
+    "alert": "\x1b[0;1;37;41m",     # white on red: the alert bar's label
+    "warn": "\x1b[0;30;43m",        # black on amber: the label when only warnings are left
     "gap": "",
 }
 GLYPHS = {
@@ -2062,6 +2279,83 @@ def p_svc(d, wi, th):
     return L
 
 
+def p_temps(d, wi, th, hi=None):
+    """Now, 24 h min/max and (tall panels) a chart for the CPU and every disk with a sensor."""
+    th_ = d.get("temps") or {}
+    now_cpu = (d.get("cpu") or {}).get("hottest")
+    now_disk = {dk["name"]: dk.get("temp") for dk in (d.get("storage") or {}).get("phys", [])}
+    hist_disks = dict(th_.get("disks") or {})
+    for k, v in now_disk.items():
+        if v is not None:
+            hist_disks.setdefault(k, [])            # a disk with a sensor shows before its history starts
+    series = [("CPU", th_.get("cpu") or [], 60, 80, "pink")]
+    series += [(k, v, 45, 55, "cyan") for k, v in sorted(hist_disks.items())]
+    L = []
+    nw = max(len(s[0]) for s in series) + 1
+    for name, vals, warn, crit, col in series:
+        v = [x for x in vals if x is not None]
+        now = now_cpu if name == "CPU" else now_disk.get(name)
+        if now is None and v:
+            now = v[-1]
+        ln = Ln(name.ljust(nw), col).add(ftemp(now, th), tcol(now, warn, crit))
+        if v:
+            ln.gap().add("min ", "grey").add(ftemp(min(v), th), "text").gap().add("max ", "grey")
+            ln.add(ftemp(max(v), th), tcol(max(v), warn, crit))
+        L.append(ln)
+    span = th_.get("span") or 0
+    L.append(Ln("history", "grey").gap().add(fmt_dur(span) if span else "starts now", "text")
+             .gap().add("1 min/col", "grey").section())
+    spare = (hi or 0) - len(L)
+    charts = [s for s in series if len([x for x in s[1] if x is not None]) >= 2]
+    if spare >= 4 and charts:
+        per = max(3, spare // len(charts))
+        for name, vals, warn, crit, col in charts:
+            if spare < 4:
+                break
+            h = min(per, spare) - 1
+            lo, top = 20.0, max(crit + 10.0, max(x for x in vals if x is not None) + 5.0)
+            shifted = [None if x is None else max(0.0, x - lo) for x in vals]
+            L.append(Ln(name + " ", col).add("%s..%s" % (ftemp(lo, th), ftemp(top, th)), "grey").section())
+            L += chart(shifted, wi, h, th, top - lo)
+            spare -= h + 1
+    return L
+
+
+def p_marzban(d, wi, th):
+    m = d.get("mz")
+    g = th.g
+    if not m:
+        return [Ln("checking...", "grey")]
+    if not m.get("ok"):
+        L = [Ln("N/A", "red"), Ln(th.clean(m.get("error", "")), "grey")]
+    else:
+        L = [Ln("Xray ", "grey").add(m.get("xray") or "?", "white").gap().add("panel ", "grey")
+             .add(th.clean(m.get("version") or "?"), "text"),
+             Ln("users ", "grey").add(str(m["active"]), "green").add("/%d active" % m["total"], "text").gap()
+             .add("online ", "grey").add(str(m["online"]), "white" if m["online"] else "text"),
+             Ln("today ", "grey").add(g["down"] + E.human(m["today_down"]), "green").add("  ")
+             .add(g["up"] + E.human(m["today_up"]), "pink").section()]
+        if m.get("rx_rate") is not None:
+            L.append(Ln("now   ", "grey").add(g["down"] + rate(m["rx_rate"]), "text").add("  ")
+                     .add(g["up"] + rate(m["tx_rate"]), "text"))
+        if m.get("expired") or m.get("limited"):
+            L.append(Ln("expired ", "grey").add(str(m.get("expired", 0)), "amber").gap()
+                     .add("limited ", "grey").add(str(m.get("limited", 0)), "amber"))
+    nodes = m.get("nodes") or []
+    if nodes:
+        nw = max(len(n["name"] or "") for n in nodes)
+        for i, n in enumerate(nodes):
+            st = n.get("status") or "?"
+            col = "green" if st == "connected" else "amber" if st in ("connecting", "disabled") else "red"
+            ln = Ln(g["dot"] + " ", col).add(th.clean(n["name"] or "?").ljust(nw), "text").gap().add(st, col)
+            if n.get("xray"):
+                ln.gap().add(n["xray"], "grey")
+            L.append(ln.section() if i == 0 else ln)
+    elif m.get("ok"):
+        L.append(Ln("no nodes", "grey").section())
+    return L
+
+
 def storage_lines(d, wi, th):
     st = d["storage"]
     if not st:
@@ -2165,11 +2459,13 @@ PANELS = {
     "weather": ("WEATHER", "amber", 36, 3.4, p_weather),
     "sys": ("SYSTEM", "red", 28, 2.4, p_sys),
     "svc": ("SERVICES", "yellow", 24, 2.6, p_svc),
+    "temps": ("TEMPERATURES", "amber", 28, 2.4, p_temps),
+    "marzban": ("MARZBAN", "purple", 30, 2.6, p_marzban),
 }
-PRIO = ["cpu", "usage", "mem", "storage", "net", "gpu", "weather", "sys", "svc"]
-CHARTED = ("cpu", "mem", "net")
-GROUPS = [["cpu", "svc"], ["usage", "mem"], ["storage"], ["net", "gpu"], ["weather"], ["sys"]]
-FLEX = ("gpu", "weather", "sys", "svc", "net", "mem")
+PRIO = ["cpu", "usage", "mem", "storage", "marzban", "net", "temps", "gpu", "weather", "sys", "svc"]
+CHARTED = ("cpu", "mem", "net", "temps")
+GROUPS = [["cpu", "svc"], ["usage", "mem"], ["storage", "temps"], ["marzban", "net", "gpu"], ["weather"], ["sys"]]
+FLEX = ("gpu", "weather", "sys", "svc", "net", "mem", "temps", "marzban")
 
 
 def spread_rows(lines, hi):
@@ -2332,6 +2628,21 @@ def header_lines(d, W, th, logo):
     return rows, ((W - stage_w, stage_w) if stage_w else None)
 
 
+def alert_bar(al, W, th, tick):
+    """One row: ' ALERT 3 ' label, then the messages (red = now, amber = soon); long lists rotate."""
+    red = any(lv == 2 for lv, _ in al)
+    head = Ln(" %s %d " % ("ALERT" if red else "WARNING", len(al)), "alert" if red else "warn").add(" ")
+    sep = " %s " % th.g["sep"]
+    start = (tick // 3) % len(al)
+    order = al[start:] + al[:start] if sum(len(t) + len(sep) for _, t in al) > W - head.n else al
+    out = Ln().cat(head)
+    for i, (lv, text) in enumerate(order):
+        if i:
+            out.add(sep, "grey")
+        out.add(th.clean(text), "red" if lv == 2 else "amber")
+    return out.fit(W, th.g["ell"], spread=False)
+
+
 def dash_height(rows, pct):
     if rows < 10:
         return 1 if rows >= 4 else 0
@@ -2347,8 +2658,13 @@ def render_parts(d, W, H, th, tick):
     head = head[:H]
     Hp = H - len(head)
     rows = [ln if stage else ln.fit(W) for ln in head]
+    al = d.get("alerts") or []
+    if al and Hp >= 5:
+        rows.append(alert_bar(al, W, th, tick))
+        Hp -= 1
     if Hp >= 3:
-        enabled = [p for p in PRIO if not (p == "weather" and d.get("weather_off")) and not (p == "gpu" and not d["gpu"])]
+        enabled = [p for p in PRIO if not (p == "weather" and d.get("weather_off")) and not (p == "gpu" and not d["gpu"])
+                   and not (p == "marzban" and not d.get("mz"))]
         cache = {}
 
         def content(p, w):
@@ -2555,8 +2871,10 @@ class Collector:
         self.services = Services()
         self.weather = Weather(conf)
         self.usage = Usage()
-        for t in (self.storage, self.services, self.weather, self.usage):
+        self.marzban = MarzbanStat(conf)
+        for t in (self.storage, self.services, self.weather, self.usage, self.marzban):
             t.start()
+        self.temps = TempHistory()
         osr = {}
         for line in (rd("/etc/os-release", "") or "").splitlines():
             k, _, v = line.partition("=")
@@ -2570,8 +2888,9 @@ class Collector:
         self.hist = {k: collections.deque(maxlen=720) for k in ("cpu", "mem", "rx", "tx")}
 
     def stop(self):
-        for t in (self.storage, self.services, self.weather, self.usage):
+        for t in (self.storage, self.services, self.weather, self.usage, self.marzban):
             t.stop()
+        self.temps.save()
 
     def snapshot(self):
         def safe(fn, default=None):
@@ -2596,7 +2915,9 @@ class Collector:
         if net:
             self.hist["rx"].append(net.get("rx_rate"))
             self.hist["tx"].append(net.get("tx_rate"))
-        return {
+        if cpu.get("hottest") is not None or st:
+            self.temps.add(cpu.get("hottest"), {dk["name"]: dk.get("temp") for dk in (st or {}).get("phys", [])})
+        d = {
             "disk_io": io_per,
             "hist": {k: list(v) for k, v in self.hist.items()},
             "cpu": cpu,
@@ -2613,7 +2934,12 @@ class Collector:
                     "procs": sum(1 for p in os.listdir("/proc") if p.isdigit()),
                     "io": io_total,
                     "refreshed": time.strftime("%H:%M:%S"), "every": self.conf.get("REFRESH", "2")},
+            "temps": self.temps.series(),
+            "mz": self.marzban.snap,
+            "backup": read_backup_state(),
         }
+        d["alerts"] = safe(lambda: alerts(d, self.conf), []) if self.conf.get("ALERTS", "on") == "on" else []
+        return d
 
 
 # ================================================================ console driver
@@ -2997,7 +3323,9 @@ def render_cli(size, charset):
     deadline = time.time() + 40
     while time.time() < deadline and (col.storage.snap is None or col.services.snap is None
                                       or col.storage.next_smart == 0
-                                      or (conf["WEATHER"] == "on" and col.weather.snap is None)):
+                                      or (conf["WEATHER"] == "on" and col.weather.snap is None)
+                                      or (conf["MARZBAN"] != "off" and os.path.isfile(MarzbanStat.ENV)
+                                          and col.marzban.snap is None)):
         time.sleep(0.5)
     d = col.snapshot()
     col.stop()
@@ -4972,6 +5300,296 @@ def main(args):
         print("eris fw: %s" % e)
         return 2
 ERIS_EOF_erisfw_py
+  put_file /usr/local/lib/eris/erisbackup.py 0644 << 'ERIS_EOF_erisbackup_py'
+"""ERIS backups: settings and databases of this server in one archive, nightly or by hand.
+
+An archive (<host>-backup-YYYYmmdd-HHMM.tar) holds
+  files.tar.gz   the folders below with full paths (the ones that exist on this server)
+  databases/     consistent copies of the live SQLite databases ("__" stands for "/")
+  RESTORE.txt    what is inside and how to put it back
+  manifest.json  host, time, ERIS version, paths and databases
+"""
+import datetime
+import hashlib
+import io
+import json
+import os
+import pwd
+import re
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+sys.path.insert(0, "/usr/local/lib/eris")
+import erislib as E  # noqa: E402
+
+STATE = os.path.join(E.STATE_DIR, "backup-state.json")
+
+# settings and data worth keeping; paths that do not exist here are skipped
+PATHS = [
+    "/etc/eris", "/var/lib/eris", "/usr/local/bin/eris", "/usr/local/lib/eris", "/usr/local/sbin/eris-uninstall",
+    "/var/lib/marzban", "/opt/marzban", "/opt/marzban-nodes", "/var/lib/marzban-nodes",
+    "/etc/x-ui", "/etc/xray-site", "/var/lib/xray-site", "/usr/local/bin/xray-site", "/usr/local/share/xray-site",
+    "/etc/claude-f-web", "/var/lib/claude-f-web",
+    "/root/.acme.sh", "/appdata", "/config/jellyfin",
+    "/etc/openmediavault", "/etc/haproxy", "/etc/nginx", "/etc/smartd.conf", "/etc/sysctl.d", "/etc/modules-load.d",
+    "/etc/systemd/system", "/etc/fstab", "/etc/docker/daemon.json", "/root/.ssh/authorized_keys",
+    "/usr/local/sbin/eris-smart-enable",
+]
+# live SQLite databases: copied with SQLite's own backup, so they are consistent
+DATABASES = ["/var/lib/marzban/db.sqlite3", "/etc/x-ui/x-ui.db", "/config/jellyfin/data/data/jellyfin.db"]
+# caches, logs and the like
+EXCLUDE = re.compile(r"(^|/)(__pycache__|cache|log|transcodes)(/|$)|\.(pyc|tmp)$")
+# services that write a database, stopped while it is restored: (database, stop, start)
+OWNERS = {
+    "/var/lib/marzban/db.sqlite3": (["docker", "compose", "-f", "/opt/marzban/docker-compose.yml", "stop"],
+                                    ["docker", "compose", "-f", "/opt/marzban/docker-compose.yml", "start"]),
+    "/etc/x-ui/x-ui.db": (["systemctl", "stop", "x-ui"], ["systemctl", "start", "x-ui"]),
+    "/config/jellyfin/data/data/jellyfin.db": (["docker", "stop", "jellyfin"], ["docker", "start", "jellyfin"]),
+}
+NAME_RX = re.compile(r"-backup-(\d{8})-(\d{4})(?:-[a-z-]+)?\.tar$")
+
+
+def db_name(path):
+    return path.strip("/").replace("/", "__")
+
+
+def prefix():
+    return re.sub(r"[^A-Za-z0-9.-]", "-", socket.gethostname()) or "eris"
+
+
+def save_state(**kw):
+    st = load_state()
+    st.update(kw)
+    os.makedirs(E.STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def skip(info):
+    rel = info.name
+    if rel.startswith(tuple(db.strip("/") for db in DATABASES)):
+        return None                       # the database copies come from SQLite itself
+    if EXCLUDE.search(rel):
+        return None
+    return info
+
+
+def archives(dest):
+    """Backups in dest, newest first: [(path, epoch)]."""
+    out = []
+    try:
+        names = os.listdir(dest)
+    except OSError:
+        return out
+    for n in names:
+        m = NAME_RX.search(n)
+        if m and os.path.isfile(os.path.join(dest, n)):
+            t = time.mktime(time.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M"))
+            out.append((os.path.join(dest, n), t))
+    return sorted(out, key=lambda x: (x[1], x[0]), reverse=True)
+
+
+def make(dest, keep=7, owner="", label="", log=print):
+    """One backup into dest; keeps the newest `keep` archives. Returns the archive path."""
+    if not dest:
+        raise ValueError("no backup folder: eris set BACKUP_DIR /path/to/folder")
+    if not os.path.isdir(dest):
+        raise ValueError("%s is not a folder (is the disk mounted?)" % dest)
+    stamp = time.strftime("%Y%m%d-%H%M")
+    name = "%s-backup-%s%s.tar" % (prefix(), stamp, "-" + label if label else "")
+    final = os.path.join(dest, name)
+    work = tempfile.mkdtemp(prefix="eris-backup-", dir="/var/tmp")
+    try:
+        dbs = []
+        os.makedirs(os.path.join(work, "databases"))
+        for src in DATABASES:
+            if not os.path.exists(src):
+                continue
+            dst = os.path.join(work, "databases", db_name(src))
+            with sqlite3.connect("file:%s?mode=ro" % src, uri=True, timeout=60) as a, sqlite3.connect(dst) as b:
+                a.backup(b)
+            ok = sqlite3.connect(dst).execute("pragma integrity_check").fetchone()[0]
+            if ok != "ok":
+                raise RuntimeError("the copy of %s fails its integrity check: %s" % (src, ok))
+            dbs.append(src)
+            log("  database %s (%d KB)" % (src, os.path.getsize(dst) // 1024))
+        have = [p for p in PATHS if os.path.lexists(p)]
+        with tarfile.open(os.path.join(work, "files.tar.gz"), "w:gz", compresslevel=6) as t:
+            for p in have:
+                t.add(p, arcname=p.lstrip("/"), filter=skip)
+        manifest = {"host": socket.gethostname(), "time": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+                    "eris": E.VERSION, "paths": have, "databases": dbs}
+        with open(os.path.join(work, "manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=1)
+        with open(os.path.join(work, "RESTORE.txt"), "w") as f:
+            f.write(restore_text(manifest))
+        tmp = final + ".part"
+        with tarfile.open(tmp, "w") as t:
+            for n in ("files.tar.gz", "databases", "manifest.json", "RESTORE.txt"):
+                t.add(os.path.join(work, n), arcname=n)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, final)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    digest = sha256(final)
+    with open(final + ".sha256", "w") as f:
+        f.write("%s  %s\n" % (digest, name))
+    if owner:
+        u = pwd.getpwnam(owner)
+        for p in (final, final + ".sha256"):
+            os.chown(p, u.pw_uid, os.stat(dest).st_gid)
+    for old, _ in archives(dest)[max(1, keep):]:
+        for p in (old, old + ".sha256"):
+            if os.path.exists(p):
+                os.remove(p)
+                log("  removed the old %s" % os.path.basename(p))
+    return final
+
+
+def restore_text(m):
+    lines = ["ERIS backup of %s, %s (ERIS Console %s)" % (m["host"], m["time"], m["eris"]), "",
+             "Put it back with:   eris restore <this file>      (eris restore --help)",
+             "or by hand:         tar -C / -xzf files.tar.gz [path ...]", "",
+             "databases/ holds consistent copies of the live SQLite databases; stop the program that",
+             "writes one before copying it back (\"__\" in the name stands for \"/\"):"]
+    for d in m["databases"]:
+        lines.append("  %-45s -> %s" % (db_name(d), d))
+    lines += ["", "Inside files.tar.gz:"] + ["  " + p for p in m["paths"]]
+    lines += ["", "It holds secrets (panel passwords, Xray keys, TLS private keys): keep it private.",
+              "Not inside: media files, Docker images, program files that an installer brings back."]
+    return "\n".join(lines) + "\n"
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify(path):
+    """(ok, message): the checksum file matches and the archive reads back."""
+    sf = path + ".sha256"
+    if os.path.exists(sf):
+        want = open(sf).read().split()[0]
+        if want != sha256(path):
+            return False, "checksum mismatch (%s)" % os.path.basename(sf)
+    try:
+        with tarfile.open(path) as t:
+            names = t.getnames()
+            if "files.tar.gz" not in names:
+                return False, "files.tar.gz is missing"
+            inner = tarfile.open(fileobj=io.BytesIO(t.extractfile("files.tar.gz").read()))
+            n = len(inner.getnames())
+    except (tarfile.TarError, OSError, EOFError) as e:
+        return False, "unreadable: %s" % e
+    return True, "%d files, %d databases" % (n, sum(1 for x in names if x.startswith("databases/") and x != "databases"))
+
+
+def manifest(path):
+    with tarfile.open(path) as t:
+        try:
+            return json.load(t.extractfile("manifest.json"))
+        except KeyError:
+            return {"host": "?", "time": "?", "eris": "?", "paths": [], "databases": []}
+
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=180).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def restore(path, to="/", only=(), log=print):
+    """Put a backup back. to="/" stops the programs whose databases come back and starts them again."""
+    ok, msg = verify(path)
+    if not ok:
+        raise ValueError("%s: %s" % (os.path.basename(path), msg))
+    only = [o.strip("/") for o in only if o.strip("/")]
+
+    def wanted(name):
+        return not only or any(name == o or name.startswith(o + "/") for o in only)
+
+    live = os.path.realpath(to) == "/"
+    with tarfile.open(path) as outer:
+        inner = tarfile.open(fileobj=io.BytesIO(outer.extractfile("files.tar.gz").read()))
+        members = [m for m in inner.getmembers() if wanted(m.name)]
+        dbs = [m for m in outer.getmembers() if m.isfile() and m.name.startswith("databases/")]
+        db_paths = {}
+        for m in dbs:
+            real = "/" + os.path.basename(m.name).replace("__", "/")
+            if wanted(real.lstrip("/")):
+                db_paths[m.name] = real
+        stopped = []
+        if live:
+            for real in db_paths.values():
+                cmds = OWNERS.get(real)
+                if cmds and run(cmds[0]):
+                    stopped.append(cmds[1])
+                    log("  stopped: %s" % " ".join(cmds[0]))
+        try:
+            # our own archive, checked against its checksum above; the "tar" filter would refuse
+            # the absolute symlinks it holds (e.g. Marzban's certificate links)
+            kw = {"filter": "fully_trusted"} if sys.version_info >= (3, 12) else {}
+            inner.extractall(to, members=members, numeric_owner=True, **kw)
+            log("  %d files put back under %s" % (len(members), to))
+            for name, real in db_paths.items():
+                dst = os.path.join(to, real.lstrip("/"))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                for side in ("-wal", "-shm"):
+                    if live and os.path.exists(dst + side):
+                        os.remove(dst + side)
+                st = os.stat(dst) if os.path.exists(dst) else None
+                with outer.extractfile(name) as src, open(dst + ".restore", "wb") as out:
+                    shutil.copyfileobj(src, out)
+                if st:
+                    os.chown(dst + ".restore", st.st_uid, st.st_gid)
+                    os.chmod(dst + ".restore", st.st_mode & 0o7777)
+                os.replace(dst + ".restore", dst)
+                log("  database %s" % dst)
+        finally:
+            if live:
+                run(["systemctl", "daemon-reload"])
+                for cmd in stopped:
+                    run(cmd)
+                    log("  started: %s" % " ".join(cmd))
+    return len(members), len(db_paths)
+
+
+def age_text(sec):
+    if sec < 3600:
+        return "%d min" % (sec // 60)
+    if sec < 86400 * 2:
+        return "%d h" % (sec // 3600)
+    return "%d days" % (sec // 86400)
+
+
+def timer_text(at):
+    return ("[Unit]\nDescription=Nightly ERIS backup (eris backup)\n\n[Timer]\nOnCalendar=*-*-* %s:00\n"
+            "Persistent=true\nRandomizedDelaySec=5min\n\n[Install]\nWantedBy=timers.target\n" % at)
+
+
+def now_iso():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+ERIS_EOF_erisbackup_py
   put_file /usr/local/lib/eris/fw-rollback 0755 << 'ERIS_EOF_fw_rollback'
 #!/bin/bash
 # ERIS firewall: undo a change nobody confirmed in time.
@@ -5019,6 +5637,8 @@ ERIS_EOF_fw_rollback
   eris render [ROWSxCOLS] [utf8|safe|ascii]   print one dashboard frame here
   eris fw [open|close|allow|deny|remove|limit|reload|confirm|off|on|backup|restore ...]
                             the firewall (eris fw help); eris firewall works too
+  eris backup [now|list|status|verify N]   settings and databases into BACKUP_DIR (nightly too)
+  eris restore N|FILE [--to DIR] [--only PATH ...] [--yes]   put a backup back (N from eris backup list)
   eris selftest             quick checks of the installed files
   eris update [--check|--force]   install the latest release (github.com/eris4444/eris-console)
   eris version
@@ -5433,6 +6053,7 @@ SIDE_EFFECTS = {
     "DASH_AT_BOOT": lambda conf: sh("systemctl", "enable" if conf["DASH_AT_BOOT"] == "yes" else "disable", UNIT),
     "FULLSCREEN_APPS": lambda conf: E.write_prompt_env(conf["CONSOLE_TTY"], conf),
     "ERIS_GLYPHS": lambda conf: (apply_font(conf, force=True), E.write_prompt_env(conf["CONSOLE_TTY"], conf)),
+    "BACKUP_AT": lambda conf: write_backup_timer(conf),
 }
 
 
@@ -5448,8 +6069,11 @@ def set_setting(key, value):
     note = ""
     if key == "PROMPT_SCOPE":
         note = " (new shells; this one: source ~/.bashrc)"
-    elif key in ("DASH_HEIGHT", "REFRESH", "WEATHER", "WEATHER_CITY", "WEATHER_UNITS", "CHARSET", "FULLSCREEN_APPS"):
+    elif key in ("DASH_HEIGHT", "REFRESH", "WEATHER", "WEATHER_CITY", "WEATHER_UNITS", "CHARSET", "FULLSCREEN_APPS",
+                 "MARZBAN", "ALERTS", "ALERT_CPU_TEMP", "ALERT_DISK_TEMP"):
         note = " (a running dashboard picks it up within a second)"
+    elif key == "BACKUP_DIR" and value:
+        note = " (nightly at %s; now: eris backup)" % conf["BACKUP_AT"]
     E.log("set %s=%s" % (key, value))
     return "%s=%s%s" % (key, value, note)
 
@@ -5503,6 +6127,7 @@ def menu():
             ("10", "Kernel messages on screen", "no (hidden)" if conf["KERNEL_MSGS"] == "hidden" else "yes"),
             ("11", "ERIS glyphs (Clawd, icons)", conf["ERIS_GLYPHS"]),
             ("12", "Firewall", fw_summary()),
+            ("13", "Nightly backup", backup_summary(conf)),
         ]
         for k, label, val in items:
             print("  %s %s %s" % (c(CYAN, "%2s)" % k), label.ljust(26, "."), c(AMBER, val)))
@@ -5572,6 +6197,8 @@ def menu_item(ch, conf):
         import erisfw
         erisfw.menu()
         return None
+    if ch == "13":
+        return backup_menu(conf)
     if ch == "s":
         cmd_on()
         return None
@@ -5614,6 +6241,182 @@ def font_menu(conf):
         if a.isdigit() and 1 <= int(a) <= len(table):
             return set_console_font(table[int(a) - 1][0]["name"])
         print("   unknown choice")
+
+
+# ---------------------------------------------------------------- backup
+
+BACKUP_TIMER = "/etc/systemd/system/eris-backup.timer"
+
+
+def write_backup_timer(conf):
+    import erisbackup as B
+    with open(BACKUP_TIMER, "w") as f:
+        f.write(B.timer_text(conf["BACKUP_AT"]))
+    sh("systemctl", "daemon-reload")
+    sh("systemctl", "enable", "--now", "eris-backup.timer")
+    sh("systemctl", "restart", "eris-backup.timer")
+
+
+def backup_summary(conf):
+    import erisbackup as B
+    if not conf["BACKUP_DIR"]:
+        return "off (set a folder: eris set BACKUP_DIR /path)"
+    st = B.load_state()
+    last = st.get("last_ok_epoch")
+    when = ("last %s ago" % B.age_text(time.time() - last)) if last else "no backup yet"
+    if st.get("last_error_epoch", 0) > (last or 0):
+        when = "LAST ONE FAILED: %s" % st.get("last_error", "")[:40]
+    return "%s at %s, keep %s, %s" % (conf["BACKUP_DIR"], conf["BACKUP_AT"], conf["BACKUP_KEEP"], when)
+
+
+def pick_archive(conf, ref):
+    """An archive from a number of `eris backup list` or a file path."""
+    import erisbackup as B
+    if ref and os.path.isfile(ref):
+        return ref
+    lst = B.archives(conf["BACKUP_DIR"])
+    if ref and ref.isdigit() and 1 <= int(ref) <= len(lst):
+        return lst[int(ref) - 1][0]
+    raise ValueError("no backup %r (see: eris backup list)" % ref)
+
+
+def cmd_backup(args):
+    need_root()
+    import erisbackup as B
+    conf = E.load_conf()
+    sub = args[0] if args else "now"
+    quiet = "--quiet" in args
+    if sub in ("now", "run", "--quiet"):
+        if "--if-set" in args and not conf["BACKUP_DIR"]:
+            return 0
+        try:
+            path = B.make(conf["BACKUP_DIR"], int(conf["BACKUP_KEEP"]), conf["BACKUP_OWNER"],
+                          log=(lambda *_: None) if quiet else print)
+        except Exception as e:
+            B.save_state(last_error="%s" % e, last_error_epoch=int(time.time()), last_error_at=B.now_iso())
+            E.log("backup failed: %s" % e)
+            print(c(RED, "eris backup: %s" % e))
+            return 1
+        ok, msg = B.verify(path)
+        size = os.path.getsize(path)
+        if not ok:
+            B.save_state(last_error="written but %s" % msg, last_error_epoch=int(time.time()), last_error_at=B.now_iso())
+            print(c(RED, "eris backup: %s was written but %s" % (path, msg)))
+            return 1
+        B.save_state(last_ok=path, last_ok_epoch=int(time.time()), last_ok_at=B.now_iso(), last_size=size,
+                     last_error="", last_error_epoch=0)
+        E.log("backup %s (%s, %s)" % (path, E.human(size), msg))
+        if not quiet:
+            print("  " + c(GREEN, "backup %s" % path) + "  %s, %s" % (E.human(size), msg))
+        return 0
+    if sub in ("list", "ls"):
+        lst = B.archives(conf["BACKUP_DIR"])
+        if not conf["BACKUP_DIR"]:
+            print("no backup folder: eris set BACKUP_DIR /path/to/folder")
+            return 1
+        print("  %s (keep %s, nightly at %s)" % (conf["BACKUP_DIR"], conf["BACKUP_KEEP"], conf["BACKUP_AT"]))
+        for i, (p, t) in enumerate(lst):
+            print("  %s %s  %8s  %s" % (c(CYAN, "%2d)" % (i + 1)), time.strftime("%Y-%m-%d %H:%M", time.localtime(t)),
+                                        E.human(os.path.getsize(p)), os.path.basename(p)))
+        if not lst:
+            print("  (no backups yet: eris backup)")
+        return 0
+    if sub == "status":
+        print("  " + backup_summary(conf))
+        st = B.load_state()
+        for k in ("last_ok", "last_ok_at", "last_size", "last_error", "last_error_at"):
+            if st.get(k):
+                print("  %-14s %s" % (k, E.human(st[k]) if k == "last_size" else st[k]))
+        print("  timer: %s, next: %s" % (svc_state("eris-backup.timer"),
+                                          sh("systemctl", "show", "-p", "NextElapseUSecRealtime", "--value",
+                                             "eris-backup.timer").stdout.strip() or "?"))
+        return 0
+    if sub == "verify":
+        path = pick_archive(conf, args[1] if len(args) > 1 else "1")
+        ok, msg = B.verify(path)
+        print("  %s: %s" % (os.path.basename(path), c(GREEN, "ok, " + msg) if ok else c(RED, msg)))
+        return 0 if ok else 1
+    print("usage: eris backup [now|list|status|verify N]")
+    return 2
+
+
+def cmd_restore(args):
+    need_root()
+    import erisbackup as B
+    conf = E.load_conf()
+    to, only, yes, ref = "/", [], False, None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--to" and i + 1 < len(args):
+            to, i = args[i + 1], i + 1
+        elif a == "--only" and i + 1 < len(args):
+            only.append(args[i + 1])
+            i += 1
+        elif a in ("--yes", "-y"):
+            yes = True
+        elif a in ("-h", "--help"):
+            print("eris restore N|FILE [--to DIR] [--only PATH ...] [--yes]\n"
+                  "  N from 'eris backup list' (1 = newest). --to DIR extracts there instead of /;\n"
+                  "  --only restores just these paths (e.g. --only /etc/x-ui --only /var/lib/marzban).\n"
+                  "  Into /, a backup of the present state is made first, and the programs whose\n"
+                  "  databases come back (Marzban, x-ui, Jellyfin) are stopped and started again.")
+            return 0
+        else:
+            ref = a
+        i += 1
+    if ref is None:
+        print("usage: eris restore N|FILE [--to DIR] [--only PATH ...] [--yes]   (eris backup list)")
+        return 2
+    path = pick_archive(conf, ref)
+    m = B.manifest(path)
+    print("  %s: %s, %s, ERIS %s" % (os.path.basename(path), m["host"], m["time"], m["eris"]))
+    print("  into %s%s" % (to, (", only " + " ".join(only)) if only else ", everything"))
+    live = os.path.realpath(to) == "/"
+    if live and not yes:
+        a = ask("   overwrite the files on this server with the backup? type yes: ")
+        if a != "yes":
+            print("  nothing changed")
+            return 1
+    if live and conf["BACKUP_DIR"] and os.path.isdir(conf["BACKUP_DIR"]):
+        try:
+            before = B.make(conf["BACKUP_DIR"], int(conf["BACKUP_KEEP"]) + 1, conf["BACKUP_OWNER"],
+                            label="before-restore", log=lambda *_: None)
+            print("  the present state is saved first: %s" % before)
+        except Exception as e:
+            print(c(RED, "  could not save the present state first (%s); nothing changed" % e))
+            return 1
+    os.makedirs(to, exist_ok=True)
+    n, dbs = B.restore(path, to, only, log=print)
+    E.log("restore %s into %s (%d files, %d databases)" % (path, to, n, dbs))
+    print("  " + c(GREEN, "done: %d files, %d databases" % (n, dbs)))
+    return 0
+
+
+def backup_menu(conf):
+    print("   " + backup_summary(conf))
+    print("   %s back up now  %s list  %s folder  %s time  %s keep  %s owner" % (
+        c(CYAN, "1)"), c(CYAN, "2)"), c(CYAN, "3)"), c(CYAN, "4)"), c(CYAN, "5)"), c(CYAN, "6)")))
+    a = ask("   backup: ")
+    if a == "1":
+        cmd_backup(["now"])
+    elif a == "2":
+        cmd_backup(["list"])
+    elif a == "3":
+        v = ask("   folder (empty = keep, '-' = off) [%s]: " % (conf["BACKUP_DIR"] or "off"))
+        if v:
+            return set_setting("BACKUP_DIR", "" if v == "-" else v)
+    elif a == "4":
+        v = ask("   time HH:MM [%s]: " % conf["BACKUP_AT"])
+        return set_setting("BACKUP_AT", v) if v else None
+    elif a == "5":
+        v = ask("   backups to keep [%s]: " % conf["BACKUP_KEEP"])
+        return set_setting("BACKUP_KEEP", v) if v else None
+    elif a == "6":
+        v = ask("   owner user (empty = keep, '-' = root) [%s]: " % (conf["BACKUP_OWNER"] or "root"))
+        if v:
+            return set_setting("BACKUP_OWNER", "" if v == "-" else v)
+    return None
 
 
 # ---------------------------------------------------------------- update
@@ -5722,9 +6525,12 @@ def cmd_selftest():
     conf = E.load_conf()
     bad = [k for k in E.SETTINGS if not E.SETTINGS[k][2](conf[k])]
     check("settings valid", not bad, E.CONF + (" bad: %s" % bad if bad else ""))
-    for u in (LOOK_UNIT, UNIT, "eris-guard.service"):
+    for u in (LOOK_UNIT, UNIT, "eris-guard.service", "eris-backup.service", "eris-backup.timer"):
         r = sh("systemctl", "cat", u)
         check("unit installed", r.returncode == 0, u)
+    check("backup timer active", svc_state("eris-backup.timer") == "active", "eris-backup.timer")
+    if conf["BACKUP_DIR"]:
+        check("backup folder exists", os.path.isdir(conf["BACKUP_DIR"]), conf["BACKUP_DIR"])
     check("look unit enabled", svc_enabled(LOOK_UNIT) == "enabled", LOOK_UNIT)
     import erisfw as F
     if os.path.isfile(F.FW_CONF):
@@ -5826,6 +6632,10 @@ def main(argv):
             return cmd_selftest()
         if cmd in ("update", "upgrade"):
             return cmd_update(args)
+        if cmd == "backup":
+            return cmd_backup(args)
+        if cmd == "restore":
+            return cmd_restore(args)
         if cmd in ("version", "--version"):
             print(E.VERSION)
             return 0
@@ -6020,6 +6830,18 @@ ExecStop=-/usr/sbin/nft delete table inet eris_guard
 [Install]
 WantedBy=multi-user.target
 ERIS_EOF_eris_guard_service
+  put_file /etc/systemd/system/eris-backup.service 0644 << 'ERIS_EOF_eris_backup_service'
+[Unit]
+Description=ERIS backup of the settings and databases (eris backup)
+After=local-fs.target docker.service
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+# --if-set: does nothing while BACKUP_DIR is empty
+ExecStart=/usr/local/bin/eris backup now --quiet --if-set
+ERIS_EOF_eris_backup_service
   write_uninstaller /usr/local/sbin/eris-uninstall
 }
 
@@ -6064,6 +6886,7 @@ mkdir -p "$BK"
 for p in /root/.bashrc /root/.profile /etc/default/console-setup /etc/eris /usr/local/bin/eris /usr/local/lib/eris \
          /usr/local/sbin/eris-uninstall /etc/systemd/system/eris-console.service \
          /etc/systemd/system/eris-dashboard.service /etc/systemd/system/eris-guard.service \
+         /etc/systemd/system/eris-backup.service /etc/systemd/system/eris-backup.timer \
          /etc/sysctl.d/90-eris-console.conf /var/lib/eris/firewall.applied; do
   if [ -e "$p" ]; then
     mkdir -p "$BK$(dirname "$p")"
@@ -6117,7 +6940,16 @@ if [ -z "${SSH_CONNECTION-}" ] && [ -x /usr/local/bin/eris ]; then /usr/local/bi
 say "shell: ERIS blocks in /root/.bashrc and /root/.profile"
 
 # 6. services: the look unit now and at boot; the dashboard stays as it was (OFF on a fresh install)
+# nightly backup timer at BACKUP_AT (the backup itself does nothing while BACKUP_DIR is empty)
+python3 -c 'import sys; sys.path.insert(0, "/usr/local/lib/eris"); import erislib as E, erisbackup as B
+open("/etc/systemd/system/eris-backup.timer", "w").write(B.timer_text(E.load_conf()["BACKUP_AT"]))'
 systemctl daemon-reload
+systemctl enable --now eris-backup.timer > /dev/null 2>&1 || say "warning: eris-backup.timer did not start"
+if grep -q '^BACKUP_DIR="/' /etc/eris/eris.conf; then
+  say "backup: nightly at $(sed -n 's/^BACKUP_AT="\(.*\)"$/\1/p' /etc/eris/eris.conf) into $(sed -n 's/^BACKUP_DIR="\(.*\)"$/\1/p' /etc/eris/eris.conf)"
+else
+  say "backup: off until a folder is set (eris set BACKUP_DIR /path/to/folder)"
+fi
 systemctl enable eris-console.service > /dev/null 2>&1
 systemctl restart eris-console.service || say "warning: eris-console.service failed (journalctl -u eris-console)"
 if [ "$(sed -n 's/^DASH_AT_BOOT="\(.*\)"$/\1/p' /etc/eris/eris.conf)" = yes ]; then
@@ -6144,6 +6976,6 @@ rc=0
 if [ "$SELFTEST" = 1 ]; then
   /usr/local/bin/eris selftest || rc=$?
 fi
-say "done. Commands: eris (menu) | eris on | eris off | eris toggle | eris enable | eris disable | eris status | eris fw | eris update"
+say "done. Commands: eris (menu) | eris on | eris off | eris toggle | eris enable | eris disable | eris status | eris fw | eris backup | eris update"
 say "remove: eris-uninstall   (or: bash $0 --uninstall)"
 exit $rc
