@@ -14,19 +14,29 @@ import subprocess
 import termios
 import time
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 REPO = os.environ.get("ERIS_REPO", "eris4444/eris-console")
 REPO_URL = "https://github.com/" + REPO
 RELEASES_API = "https://api.github.com/repos/%s/releases/latest" % REPO
 DOWNLOAD_URL = REPO_URL + "/releases/download/%s/install-eris.sh"
-CONF = "/etc/eris/eris.conf"
-STATE_DIR = "/var/lib/eris"
-RUN_DIR = "/run/eris"
+# ERIS_ROOT moves every path under another folder (tests: ERIS_ROOT=/tmp/fake); empty on a real server
+ROOT = os.environ.get("ERIS_ROOT", "").rstrip("/")
+
+
+def R(path):
+    """A path of the server, under ERIS_ROOT when that is set."""
+    return ROOT + path if ROOT and path.startswith("/") else path
+
+
+CONF = R("/etc/eris/eris.conf")
+STATE_DIR = R("/var/lib/eris")
+RUN_DIR = R("/run/eris")
 FONT_DIR = "/usr/share/consolefonts"
 CONSOLE_SETUP = "/etc/default/console-setup"
-SYSCTL_FILE = "/etc/sysctl.d/90-eris-console.conf"
-BACKUP_ROOT = "/var/backups/eris"
-LOG = "/var/log/eris-build.log"
+SYSCTL_FILE = R("/etc/sysctl.d/90-eris-console.conf")
+BACKUP_ROOT = R("/var/backups/eris")
+LOG = R("/var/log/eris-build.log")
+TMP_DIR = R("/var/tmp")
 
 FULLSCREEN_DEFAULT = ("vim vi nvim view vimdiff vim.basic vim.tiny nano pico emacs editor sensible-editor "
                       "htop top btop atop less more most pager sensible-pager man mc mcedit ncdu tmux screen "
@@ -66,7 +76,30 @@ SETTINGS = {
     "BACKUP_AT": ("03:30", "HH:MM", lambda v: re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9]", v) is not None),
     "BACKUP_OWNER": ("", "user that owns the backups (e.g. to read them over SMB), empty = root",
                      lambda v: v == "" or re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", v) is not None),
+    "BACKUP_FULL": ("on", "on|off", lambda v: v in ("on", "off")),
+    "BACKUP_PARTS": ("all", "all, none or part names separated by commas (eris backup parts)",
+                     lambda v: valid_parts(v)),
+    "BACKUP_PART_KEEP": ("7", "1-90 backups of each part", lambda v: v.isdigit() and 1 <= int(v) <= 90),
 }
+
+# the parts of the server that are also backed up one by one (erisbackup.PARTS has their paths)
+PART_NAMES = ("marzban", "x-ui", "xray-site", "jellyfin", "eris", "claude-f-web", "system")
+
+
+def valid_parts(v):
+    if v in ("all", "none"):
+        return True
+    names = [x.strip() for x in v.split(",")]
+    return bool(names) and all(n in PART_NAMES for n in names) and len(set(names)) == len(names)
+
+
+def parts_setting(v):
+    """BACKUP_PARTS as a list of part names."""
+    if v == "all":
+        return list(PART_NAMES)
+    if v == "none" or not valid_parts(v):
+        return []
+    return [x.strip() for x in v.split(",")]
 
 COMMENTS = {
     "DASH_HEIGHT": "dashboard height in % of the console rows",
@@ -93,6 +126,9 @@ COMMENTS = {
     "BACKUP_KEEP": "how many backups to keep; older ones are deleted",
     "BACKUP_AT": "time of the nightly backup",
     "BACKUP_OWNER": "owner of the backup files (they stay readable only by this user), empty = root",
+    "BACKUP_FULL": "on = the nightly backup also makes the full archive (in BACKUP_DIR/full, never sent anywhere)",
+    "BACKUP_PARTS": "parts backed up one by one into BACKUP_DIR/<part>: all, none or e.g. marzban,x-ui",
+    "BACKUP_PART_KEEP": "how many backups of each part to keep",
 }
 
 # ANSI order 0..15: black red green amber blue purple cyan white, then the bright set

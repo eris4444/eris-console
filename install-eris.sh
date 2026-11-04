@@ -9,7 +9,7 @@
 #   bash install-eris.sh --uninstall     remove everything (same as eris-uninstall)
 #   bash install-eris.sh --no-selftest   skip the checks at the end
 set -euo pipefail
-VERSION=2.4.0
+VERSION=2.5.0
 LOG=/var/log/eris-build.log
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/var/backups/eris/$TS
@@ -155,19 +155,29 @@ import subprocess
 import termios
 import time
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 REPO = os.environ.get("ERIS_REPO", "eris4444/eris-console")
 REPO_URL = "https://github.com/" + REPO
 RELEASES_API = "https://api.github.com/repos/%s/releases/latest" % REPO
 DOWNLOAD_URL = REPO_URL + "/releases/download/%s/install-eris.sh"
-CONF = "/etc/eris/eris.conf"
-STATE_DIR = "/var/lib/eris"
-RUN_DIR = "/run/eris"
+# ERIS_ROOT moves every path under another folder (tests: ERIS_ROOT=/tmp/fake); empty on a real server
+ROOT = os.environ.get("ERIS_ROOT", "").rstrip("/")
+
+
+def R(path):
+    """A path of the server, under ERIS_ROOT when that is set."""
+    return ROOT + path if ROOT and path.startswith("/") else path
+
+
+CONF = R("/etc/eris/eris.conf")
+STATE_DIR = R("/var/lib/eris")
+RUN_DIR = R("/run/eris")
 FONT_DIR = "/usr/share/consolefonts"
 CONSOLE_SETUP = "/etc/default/console-setup"
-SYSCTL_FILE = "/etc/sysctl.d/90-eris-console.conf"
-BACKUP_ROOT = "/var/backups/eris"
-LOG = "/var/log/eris-build.log"
+SYSCTL_FILE = R("/etc/sysctl.d/90-eris-console.conf")
+BACKUP_ROOT = R("/var/backups/eris")
+LOG = R("/var/log/eris-build.log")
+TMP_DIR = R("/var/tmp")
 
 FULLSCREEN_DEFAULT = ("vim vi nvim view vimdiff vim.basic vim.tiny nano pico emacs editor sensible-editor "
                       "htop top btop atop less more most pager sensible-pager man mc mcedit ncdu tmux screen "
@@ -207,7 +217,30 @@ SETTINGS = {
     "BACKUP_AT": ("03:30", "HH:MM", lambda v: re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9]", v) is not None),
     "BACKUP_OWNER": ("", "user that owns the backups (e.g. to read them over SMB), empty = root",
                      lambda v: v == "" or re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", v) is not None),
+    "BACKUP_FULL": ("on", "on|off", lambda v: v in ("on", "off")),
+    "BACKUP_PARTS": ("all", "all, none or part names separated by commas (eris backup parts)",
+                     lambda v: valid_parts(v)),
+    "BACKUP_PART_KEEP": ("7", "1-90 backups of each part", lambda v: v.isdigit() and 1 <= int(v) <= 90),
 }
+
+# the parts of the server that are also backed up one by one (erisbackup.PARTS has their paths)
+PART_NAMES = ("marzban", "x-ui", "xray-site", "jellyfin", "eris", "claude-f-web", "system")
+
+
+def valid_parts(v):
+    if v in ("all", "none"):
+        return True
+    names = [x.strip() for x in v.split(",")]
+    return bool(names) and all(n in PART_NAMES for n in names) and len(set(names)) == len(names)
+
+
+def parts_setting(v):
+    """BACKUP_PARTS as a list of part names."""
+    if v == "all":
+        return list(PART_NAMES)
+    if v == "none" or not valid_parts(v):
+        return []
+    return [x.strip() for x in v.split(",")]
 
 COMMENTS = {
     "DASH_HEIGHT": "dashboard height in % of the console rows",
@@ -234,6 +267,9 @@ COMMENTS = {
     "BACKUP_KEEP": "how many backups to keep; older ones are deleted",
     "BACKUP_AT": "time of the nightly backup",
     "BACKUP_OWNER": "owner of the backup files (they stay readable only by this user), empty = root",
+    "BACKUP_FULL": "on = the nightly backup also makes the full archive (in BACKUP_DIR/full, never sent anywhere)",
+    "BACKUP_PARTS": "parts backed up one by one into BACKUP_DIR/<part>: all, none or e.g. marzban,x-ui",
+    "BACKUP_PART_KEEP": "how many backups of each part to keep",
 }
 
 # ANSI order 0..15: black red green amber blue purple cyan white, then the bright set
@@ -1449,13 +1485,25 @@ def alerts(d, conf):
                 out.append((2, "node %s %s" % (n.get("name"), n.get("status"))))
     if conf.get("BACKUP_DIR"):
         b = d.get("backup") or {}
-        last = b.get("last_ok_epoch")
-        if b.get("last_error_epoch", 0) > (last or 0):
-            out.append((2, "backup failed"))
+        parts = {k: v for k, v in (b.get("parts") or {}).items()
+                 if isinstance(v, dict) and k in E.parts_setting(conf.get("BACKUP_PARTS", "all"))}
+        failed = False
+        if conf.get("BACKUP_FULL", "on") == "on":
+            last = b.get("last_ok_epoch")
+            failed = b.get("last_error_epoch", 0) > (last or 0)
+            if failed:
+                out.append((2, "backup failed"))
+        else:   # only parts: the age of the newest part backup
+            last = max([p.get("last_ok_epoch") or 0 for p in parts.values()] or [0]) or None
+        if failed:
+            pass
         elif not last:
             out.append((1, "no backup yet"))
         elif time.time() - last > 36 * 3600:
             out.append((1, "backup %dd old" % ((time.time() - last) // 86400 or 1)))
+        for name, p in sorted(parts.items()):
+            if p.get("last_error_epoch", 0) > (p.get("last_ok_epoch") or 0):
+                out.append((2, "backup %s failed" % name))
         if not os.path.isdir(conf["BACKUP_DIR"]):
             out.append((2, "backup folder missing"))
     return sorted(out, key=lambda x: -x[0])
@@ -5319,15 +5367,21 @@ def main(args):
         return 2
 ERIS_EOF_erisfw_py
   put_file /usr/local/lib/eris/erisbackup.py 0644 << 'ERIS_EOF_erisbackup_py'
-"""ERIS backups: settings and databases of this server in one archive, nightly or by hand.
+"""ERIS backups: settings and databases of this server, nightly or by hand.
 
-An archive (<host>-backup-YYYYmmdd-HHMM.tar) holds
+Two kinds, each in a folder of its own under BACKUP_DIR:
+  full/      the whole server in one archive (<host>-backup-YYYYmmdd-HHMM.tar); it stays on this disk
+  <part>/    one part of the server (<host>-<part>-backup-YYYYmmdd-HHMM.tar), see PARTS
+
+An archive holds
   files.tar.gz   the folders below with full paths (the ones that exist on this server)
   databases/     consistent copies of the live SQLite databases ("__" stands for "/")
   RESTORE.txt    what is inside and how to put it back
-  manifest.json  host, time, ERIS version, paths and databases
+  manifest.json  host, time, ERIS version, part, paths and databases
 """
+import contextlib
 import datetime
+import fcntl
 import hashlib
 import io
 import json
@@ -5343,10 +5397,12 @@ import tarfile
 import tempfile
 import time
 
-sys.path.insert(0, "/usr/local/lib/eris")
+sys.path.insert(0, os.environ.get("ERIS_LIB", "/usr/local/lib/eris"))
 import erislib as E  # noqa: E402
 
 STATE = os.path.join(E.STATE_DIR, "backup-state.json")
+LOCK = os.path.join(E.RUN_DIR, "backup.lock")
+FULL = "full"
 
 # settings and data worth keeping; paths that do not exist here are skipped
 PATHS = [
@@ -5361,6 +5417,57 @@ PATHS = [
 ]
 # live SQLite databases: copied with SQLite's own backup, so they are consistent
 DATABASES = ["/var/lib/marzban/db.sqlite3", "/etc/x-ui/x-ui.db", "/config/jellyfin/data/data/jellyfin.db"]
+
+# The parts backed up one by one. A part is on this server when one of its "detect" paths exists.
+# To add a part: one entry here and its name in erislib.PART_NAMES.
+PARTS = {
+    "marzban": {
+        "title": "Marzban panel and its nodes",
+        "detect": ["/opt/marzban", "/var/lib/marzban"],
+        "paths": ["/var/lib/marzban", "/opt/marzban", "/opt/marzban-nodes", "/var/lib/marzban-nodes"],
+        "databases": ["/var/lib/marzban/db.sqlite3"],
+    },
+    "x-ui": {
+        "title": "3x-ui panel",
+        "detect": ["/etc/x-ui"],
+        "paths": ["/etc/x-ui", "/etc/systemd/system/x-ui.service"],
+        "databases": ["/etc/x-ui/x-ui.db"],
+    },
+    "xray-site": {
+        "title": "xray-site, certificates (acme.sh), haproxy and nginx",
+        "detect": ["/etc/xray-site", "/usr/local/bin/xray-site"],
+        "paths": ["/etc/xray-site", "/var/lib/xray-site", "/usr/local/bin/xray-site", "/usr/local/share/xray-site",
+                  "/root/.acme.sh", "/etc/haproxy", "/etc/nginx"],
+        "databases": [],
+    },
+    "jellyfin": {
+        "title": "Jellyfin settings and library database (no cache, logs or transcodes)",
+        "detect": ["/config/jellyfin", "/appdata/JellyFin"],
+        "paths": ["/config/jellyfin", "/appdata/JellyFin"],
+        "databases": ["/config/jellyfin/data/data/jellyfin.db"],
+    },
+    "eris": {
+        "title": "ERIS Console settings and state",
+        "detect": ["/etc/eris"],
+        "paths": ["/etc/eris", "/var/lib/eris"],
+        "databases": [],
+    },
+    "claude-f-web": {
+        "title": "Claude F Web",
+        "detect": ["/etc/claude-f-web", "/var/lib/claude-f-web"],
+        "paths": ["/etc/claude-f-web", "/var/lib/claude-f-web"],
+        "databases": [],
+    },
+    "system": {
+        "title": "System settings (openmediavault, systemd units, fstab, sysctl, SSH keys, Docker)",
+        "detect": ["/etc/fstab", "/etc/systemd/system"],
+        "paths": ["/etc/openmediavault", "/etc/systemd/system", "/etc/fstab", "/etc/sysctl.d", "/etc/modules-load.d",
+                  "/root/.ssh/authorized_keys", "/etc/docker/daemon.json"],
+        "databases": [],
+    },
+}
+assert tuple(PARTS) == E.PART_NAMES, "erislib.PART_NAMES and erisbackup.PARTS differ"
+
 # caches, logs and the like
 EXCLUDE = re.compile(r"(^|/)(__pycache__|cache|log|transcodes)(/|$)|\.(pyc|tmp)$")
 # services that write a database, stopped while it is restored: (database, stop, start)
@@ -5370,7 +5477,9 @@ OWNERS = {
     "/etc/x-ui/x-ui.db": (["systemctl", "stop", "x-ui"], ["systemctl", "start", "x-ui"]),
     "/config/jellyfin/data/data/jellyfin.db": (["docker", "stop", "jellyfin"], ["docker", "start", "jellyfin"]),
 }
-NAME_RX = re.compile(r"-backup-(\d{8})-(\d{4})(?:-[a-z-]+)?\.tar$")
+NAME_RX = re.compile(r"-backup-(\d{8})-(\d{4})(\d{2})?(?:-([a-z-]+))?\.tar$")
+CIPHER = ["-aes-256-cbc", "-pbkdf2", "-iter", "200000"]
+DECRYPT_HINT = "openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in FILE.enc -out FILE.tar"
 
 
 def db_name(path):
@@ -5381,31 +5490,134 @@ def prefix():
     return re.sub(r"[^A-Za-z0-9.-]", "-", socket.gethostname()) or "eris"
 
 
-def save_state(**kw):
-    st = load_state()
-    st.update(kw)
+# ---------------------------------------------------------------- state (backup-state.json)
+# The keys at the top level describe the full backup (as in ERIS 2.4); "parts" holds one entry per part.
+
+@contextlib.contextmanager
+def _state_lock():
     os.makedirs(E.STATE_DIR, exist_ok=True)
+    with open(STATE + ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lk, fcntl.LOCK_UN)
+
+
+def _write_state(st):
     tmp = STATE + ".tmp"
     with open(tmp, "w") as f:
         json.dump(st, f, indent=1)
     os.replace(tmp, STATE)
 
 
+def save_state(**kw):
+    """Update the full-backup keys."""
+    with _state_lock():
+        st = load_state()
+        st.update(kw)
+        _write_state(st)
+
+
+def save_part_state(part, **kw):
+    with _state_lock():
+        st = load_state()
+        parts = st.get("parts") if isinstance(st.get("parts"), dict) else {}
+        cur = parts.get(part) if isinstance(parts.get(part), dict) else {}
+        cur.update(kw)
+        parts[part] = cur
+        st["parts"] = parts
+        _write_state(st)
+
+
 def load_state():
     try:
         with open(STATE) as f:
-            return json.load(f)
+            st = json.load(f)
+            return st if isinstance(st, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
-def skip(info):
-    rel = info.name
-    if rel.startswith(tuple(db.strip("/") for db in DATABASES)):
-        return None                       # the database copies come from SQLite itself
-    if EXCLUDE.search(rel):
-        return None
-    return info
+def part_state(part):
+    st = load_state()
+    return (st.get("parts") or {}).get(part) or {} if part != FULL else {k: v for k, v in st.items() if k != "parts"}
+
+
+@contextlib.contextmanager
+def lock(wait=True):
+    """One backup or restore at a time (the nightly timer, the menu, eris-bot)."""
+    os.makedirs(E.RUN_DIR, exist_ok=True)
+    with open(LOCK, "a") as lk:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            raise RuntimeError("another backup or restore is running")
+        try:
+            yield
+        finally:
+            fcntl.flock(lk, fcntl.LOCK_UN)
+
+
+# ---------------------------------------------------------------- folders and parts
+
+def present(part):
+    """True when the part is on this server."""
+    return any(os.path.lexists(E.R(p)) for p in PARTS[part]["detect"])
+
+
+def folder(base, part=None, owner="", create=True):
+    """BACKUP_DIR/full or BACKUP_DIR/<part>; made (and given to owner) on first use."""
+    if not base:
+        raise ValueError("no backup folder: eris set BACKUP_DIR /path/to/folder")
+    if not os.path.isdir(base):
+        raise ValueError("%s is not a folder (is the disk mounted?)" % base)
+    d = os.path.join(base, part or FULL)
+    if create and not os.path.isdir(d):
+        os.makedirs(d, mode=0o750)
+        if owner:
+            os.chown(d, pwd.getpwnam(owner).pw_uid, os.stat(base).st_gid)
+    return d
+
+
+def migrate(base, owner="", log=print):
+    """Backups of ERIS 2.4 lie in BACKUP_DIR itself: move them (and their .sha256) into BACKUP_DIR/full once."""
+    if not base or not os.path.isdir(base):
+        return 0
+    moved = 0
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return 0
+    old = [n for n in names if NAME_RX.search(n) and os.path.isfile(os.path.join(base, n))]
+    if not old:
+        return 0
+    dest = folder(base, None, owner)
+    for n in old:
+        for x in (n, n + ".sha256"):
+            src = os.path.join(base, x)
+            if os.path.isfile(src):
+                os.replace(src, os.path.join(dest, x))
+        moved += 1
+    log("  moved %d older backup%s into %s" % (moved, "s"[:moved != 1], dest))
+    return moved
+
+
+def skipper(databases):
+    dbs = tuple(db.strip("/") for db in databases)
+
+    def skip(info):
+        rel = info.name
+        if dbs and rel.startswith(dbs):
+            return None                       # the database copies come from SQLite itself
+        if EXCLUDE.search(rel):
+            return None
+        return info
+    return skip
+
+
+def skip(info):  # ERIS 2.4 name, the full backup's filter
+    return skipper(DATABASES)(info)
 
 
 def archives(dest):
@@ -5418,41 +5630,59 @@ def archives(dest):
     for n in names:
         m = NAME_RX.search(n)
         if m and os.path.isfile(os.path.join(dest, n)):
-            t = time.mktime(time.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M"))
+            t = time.mktime(time.strptime(m.group(1) + m.group(2) + (m.group(3) or "00"), "%Y%m%d%H%M%S"))
             out.append((os.path.join(dest, n), t))
     return sorted(out, key=lambda x: (x[1], x[0]), reverse=True)
 
 
-def make(dest, keep=7, owner="", label="", log=print):
-    """One backup into dest; keeps the newest `keep` archives. Returns the archive path."""
+def make(dest, keep=7, owner="", label="", log=print, part=None):
+    """One backup into dest (the full one, or one part); keeps the newest `keep` archives there.
+    Returns the archive path."""
     if not dest:
         raise ValueError("no backup folder: eris set BACKUP_DIR /path/to/folder")
     if not os.path.isdir(dest):
         raise ValueError("%s is not a folder (is the disk mounted?)" % dest)
-    stamp = time.strftime("%Y%m%d-%H%M")
-    name = "%s-backup-%s%s.tar" % (prefix(), stamp, "-" + label if label else "")
+    if part:
+        if part not in PARTS:
+            raise ValueError("unknown part %s (eris backup parts)" % part)
+        paths, databases = PARTS[part]["paths"], PARTS[part]["databases"]
+    else:
+        paths, databases = PATHS, DATABASES
+    have = [p for p in paths if os.path.lexists(E.R(p))]
+    if part and not have:
+        raise ValueError("nothing of %s is on this server" % part)
+    base = "%s%s-backup-" % (prefix(), "-" + part if part else "")
+    tail = ("-" + label if label else "") + ".tar"
+    name = base + time.strftime("%Y%m%d-%H%M") + tail
+    while os.path.exists(os.path.join(dest, name)):       # another backup in the same minute (or second)
+        name = base + time.strftime("%Y%m%d-%H%M%S") + tail
+        if os.path.exists(os.path.join(dest, name)):
+            time.sleep(1)
     final = os.path.join(dest, name)
-    work = tempfile.mkdtemp(prefix="eris-backup-", dir="/var/tmp")
+    tmpdir = E.TMP_DIR if os.path.isdir(E.TMP_DIR) else None
+    work = tempfile.mkdtemp(prefix="eris-backup-", dir=tmpdir)
     try:
         dbs = []
         os.makedirs(os.path.join(work, "databases"))
-        for src in DATABASES:
-            if not os.path.exists(src):
+        for src in databases:
+            real = E.R(src)
+            if not os.path.exists(real):
                 continue
             dst = os.path.join(work, "databases", db_name(src))
-            with sqlite3.connect("file:%s?mode=ro" % src, uri=True, timeout=60) as a, sqlite3.connect(dst) as b:
+            with contextlib.closing(sqlite3.connect("file:%s?mode=ro" % real, uri=True, timeout=60)) as a, \
+                    contextlib.closing(sqlite3.connect(dst)) as b:
                 a.backup(b)
-            ok = sqlite3.connect(dst).execute("pragma integrity_check").fetchone()[0]
+            with contextlib.closing(sqlite3.connect(dst)) as chk:
+                ok = chk.execute("pragma integrity_check").fetchone()[0]
             if ok != "ok":
                 raise RuntimeError("the copy of %s fails its integrity check: %s" % (src, ok))
             dbs.append(src)
             log("  database %s (%d KB)" % (src, os.path.getsize(dst) // 1024))
-        have = [p for p in PATHS if os.path.lexists(p)]
         with tarfile.open(os.path.join(work, "files.tar.gz"), "w:gz", compresslevel=6) as t:
             for p in have:
-                t.add(p, arcname=p.lstrip("/"), filter=skip)
+                t.add(E.R(p), arcname=p.lstrip("/"), filter=skipper(databases))
         manifest = {"host": socket.gethostname(), "time": time.strftime("%Y-%m-%d %H:%M:%S %z"),
-                    "eris": E.VERSION, "paths": have, "databases": dbs}
+                    "eris": E.VERSION, "part": part or FULL, "paths": have, "databases": dbs}
         with open(os.path.join(work, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=1)
         with open(os.path.join(work, "RESTORE.txt"), "w") as f:
@@ -5465,6 +5695,8 @@ def make(dest, keep=7, owner="", label="", log=print):
         os.replace(tmp, final)
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        if os.path.exists(final + ".part"):
+            os.remove(final + ".part")
     digest = sha256(final)
     with open(final + ".sha256", "w") as f:
         f.write("%s  %s\n" % (digest, name))
@@ -5481,7 +5713,8 @@ def make(dest, keep=7, owner="", label="", log=print):
 
 
 def restore_text(m):
-    lines = ["ERIS backup of %s, %s (ERIS Console %s)" % (m["host"], m["time"], m["eris"]), "",
+    what = "" if m.get("part", FULL) == FULL else ", part %s" % m["part"]
+    lines = ["ERIS backup of %s%s, %s (ERIS Console %s)" % (m["host"], what, m["time"], m["eris"]), "",
              "Put it back with:   eris restore <this file>      (eris restore --help)",
              "or by hand:         tar -C / -xzf files.tar.gz [path ...]", "",
              "databases/ holds consistent copies of the live SQLite databases; stop the program that",
@@ -5502,23 +5735,39 @@ def sha256(path):
     return h.hexdigest()
 
 
-def verify(path):
-    """(ok, message): the checksum file matches and the archive reads back."""
-    sf = path + ".sha256"
-    if os.path.exists(sf):
-        want = open(sf).read().split()[0]
-        if want != sha256(path):
-            return False, "checksum mismatch (%s)" % os.path.basename(sf)
+def stored_sha256(path):
+    """The checksum written next to the archive, or None."""
+    try:
+        with open(path + ".sha256") as f:
+            return f.read().split()[0]
+    except (OSError, IndexError):
+        return None
+
+
+def check(path):
+    """{"ok", "message", "files", "databases"}: the checksum file matches and the archive reads back."""
+    want = stored_sha256(path)
+    if want is not None and want != sha256(path):
+        return {"ok": False, "message": "checksum mismatch (%s.sha256)" % os.path.basename(path), "files": 0, "databases": 0}
     try:
         with tarfile.open(path) as t:
             names = t.getnames()
             if "files.tar.gz" not in names:
-                return False, "files.tar.gz is missing"
-            inner = tarfile.open(fileobj=io.BytesIO(t.extractfile("files.tar.gz").read()))
-            n = len(inner.getnames())
-    except (tarfile.TarError, OSError, EOFError) as e:
-        return False, "unreadable: %s" % e
-    return True, "%d files, %d databases" % (n, sum(1 for x in names if x.startswith("databases/") and x != "databases"))
+                return {"ok": False, "message": "files.tar.gz is missing", "files": 0, "databases": 0}
+            n = 0
+            with tarfile.open(fileobj=t.extractfile("files.tar.gz"), mode="r|gz") as inner:
+                for _ in inner:
+                    n += 1
+    except (tarfile.TarError, OSError, EOFError, ValueError) as e:
+        return {"ok": False, "message": "unreadable: %s" % e, "files": 0, "databases": 0}
+    dbs = sum(1 for x in names if x.startswith("databases/") and x != "databases")
+    return {"ok": True, "message": "%d files, %d databases" % (n, dbs), "files": n, "databases": dbs}
+
+
+def verify(path):
+    """(ok, message): the checksum file matches and the archive reads back."""
+    r = check(path)
+    return r["ok"], r["message"]
 
 
 def manifest(path):
@@ -5529,7 +5778,23 @@ def manifest(path):
             return {"host": "?", "time": "?", "eris": "?", "paths": [], "databases": []}
 
 
+def describe(path, epoch=None):
+    """What eris backup list --json shows for one archive (no unpacking)."""
+    m = NAME_RX.search(os.path.basename(path))
+    if epoch is None and m:
+        epoch = time.mktime(time.strptime(m.group(1) + m.group(2) + (m.group(3) or "00"), "%Y%m%d%H%M%S"))
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = None
+    return {"path": path, "name": os.path.basename(path), "epoch": int(epoch or 0),
+            "time": time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch or 0)),
+            "size": size, "sha256": stored_sha256(path), "label": (m.group(4) if m else None) or ""}
+
+
 def run(cmd):
+    if E.ROOT:                      # a test tree: never touch the real services
+        return True
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=180).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
@@ -5546,7 +5811,7 @@ def restore(path, to="/", only=(), log=print):
     def wanted(name):
         return not only or any(name == o or name.startswith(o + "/") for o in only)
 
-    live = os.path.realpath(to) == "/"
+    live = os.path.realpath(to) == os.path.realpath(E.R("/") or "/")
     with tarfile.open(path) as outer:
         inner = tarfile.open(fileobj=io.BytesIO(outer.extractfile("files.tar.gz").read()))
         members = [m for m in inner.getmembers() if wanted(m.name)]
@@ -5591,6 +5856,47 @@ def restore(path, to="/", only=(), log=print):
                     log("  started: %s" % " ".join(cmd))
     return len(members), len(db_paths)
 
+
+# ---------------------------------------------------------------- encryption (for copies that leave this server)
+
+def _openssl(args, src, out, password_file):
+    if not os.path.isfile(password_file) or os.path.getsize(password_file) == 0:
+        raise ValueError("no password in %s" % password_file)
+    if not os.path.isfile(src):
+        raise ValueError("%s does not exist" % src)
+    tmp = out + ".tmp"
+    try:
+        r = subprocess.run(["openssl", "enc"] + args + CIPHER + ["-in", src, "-out", tmp, "-pass", "file:" + password_file],
+                           capture_output=True, text=True, timeout=3600, preexec_fn=lambda: os.umask(0o077))
+    except FileNotFoundError:
+        raise RuntimeError("openssl is not installed")
+    if r.returncode != 0:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        err = r.stderr.strip().splitlines()
+        if "-d" in args:
+            raise ValueError("cannot decrypt %s: wrong password or a damaged file (%s)" % (
+                os.path.basename(src), err[0] if err else r.returncode))
+        raise RuntimeError("openssl failed: %s" % (err[0] if err else r.returncode))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, out)
+    return out
+
+
+def encrypt(path, password_file, out=None):
+    """AES-256-CBC with PBKDF2 (200000 rounds) and a random salt; the password is read from a file
+    (openssl -pass file:), so it never shows up in ps. Returns the .enc path."""
+    return _openssl(["-salt"], path, out or path + ".enc", password_file)
+
+
+def decrypt(path, password_file, out=None):
+    """The reverse of encrypt(); FILE.enc -> FILE (by hand: DECRYPT_HINT)."""
+    if out is None:
+        out = path[:-4] if path.endswith(".enc") else path + ".dec"
+    return _openssl(["-d"], path, out, password_file)
+
+
+# ---------------------------------------------------------------- small helpers
 
 def age_text(sec):
     if sec < 3600:
@@ -5656,8 +5962,9 @@ ERIS_EOF_fw_rollback
   eris render [ROWSxCOLS] [utf8|safe|ascii]   print one dashboard frame here
   eris fw [open|close|allow|deny|remove|limit|reload|confirm|off|on|backup|restore ...]
                             the firewall (eris fw help); eris firewall works too
-  eris backup [now|list|status|verify N]   settings and databases into BACKUP_DIR (nightly too)
-  eris restore N|FILE [--to DIR] [--only PATH ...] [--yes]   put a backup back (N from eris backup list)
+  eris backup [now|list|status|verify|parts|encrypt|decrypt] [--full|--parts|--part NAME] [--json]
+                            the full backup and each part into BACKUP_DIR/full, BACKUP_DIR/<part> (nightly too)
+  eris restore [--part NAME] N|FILE [--to DIR] [--only PATH ...] [--yes]   put a backup back (eris backup list)
   eris selftest             quick checks of the installed files
   eris update [--check|--force]   install the latest release (github.com/eris4444/eris-console)
   eris version
@@ -5670,7 +5977,7 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, "/usr/local/lib/eris")
+sys.path.insert(0, os.environ.get("ERIS_LIB", "/usr/local/lib/eris"))
 import erislib as E  # noqa: E402
 
 UNIT = "eris-dashboard.service"
@@ -5691,6 +5998,8 @@ def sh(*cmd, timeout=60):
         return subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(cmd, 124, "", "timeout")
+    except OSError as e:          # e.g. no systemctl in a container
+        return subprocess.CompletedProcess(cmd, 127, "", str(e))
 
 
 def need_root():
@@ -6289,6 +6598,16 @@ def cmd_full(args, quiet=False):
 # ---------------------------------------------------------------- backup
 
 BACKUP_TIMER = "/etc/systemd/system/eris-backup.timer"
+BACKUP_USAGE = """eris backup [now|list|status|verify|parts|encrypt|decrypt] ...
+  eris backup now [--full | --parts | --part NAME[,NAME]] [--json] [--quiet]
+                       no option: the full backup (BACKUP_FULL) and every part in BACKUP_PARTS
+  eris backup list [--full | --part NAME] [--json]        numbered, newest first
+  eris backup status [--json]                             the last result of the full backup and of each part
+  eris backup verify [N|FILE] [--full | --part NAME] [--json]
+  eris backup parts [--json]                              the parts and what each one holds
+  eris backup encrypt FILE --password-file F [--out OUT]  AES-256 (openssl, PBKDF2 200000 rounds) -> FILE.enc
+  eris backup decrypt FILE.enc --password-file F [--out OUT]
+Folders: BACKUP_DIR/full (the full backup, it stays on this disk) and BACKUP_DIR/<part>."""
 
 
 def write_backup_timer(conf):
@@ -6300,6 +6619,10 @@ def write_backup_timer(conf):
     sh("systemctl", "restart", "eris-backup.timer")
 
 
+def failed_state(st):
+    return st.get("last_error_epoch", 0) > (st.get("last_ok_epoch") or 0)
+
+
 def backup_summary(conf):
     import erisbackup as B
     if not conf["BACKUP_DIR"]:
@@ -6307,87 +6630,303 @@ def backup_summary(conf):
     st = B.load_state()
     last = st.get("last_ok_epoch")
     when = ("last %s ago" % B.age_text(time.time() - last)) if last else "no backup yet"
-    if st.get("last_error_epoch", 0) > (last or 0):
+    if failed_state(st):
         when = "LAST ONE FAILED: %s" % st.get("last_error", "")[:40]
-    return "%s at %s, keep %s, %s" % (conf["BACKUP_DIR"], conf["BACKUP_AT"], conf["BACKUP_KEEP"], when)
+    if conf["BACKUP_FULL"] != "on":
+        when = "full backup off"
+    parts = E.parts_setting(conf["BACKUP_PARTS"])
+    pst = st.get("parts") or {}
+    bad = [p for p in parts if failed_state(pst.get(p) or {})]
+    ptxt = "%d parts" % len(parts) if parts else "no parts"
+    if bad:
+        ptxt += " (FAILED: %s)" % ",".join(bad)
+    return "%s at %s, keep %s, %s; %s" % (conf["BACKUP_DIR"], conf["BACKUP_AT"], conf["BACKUP_KEEP"], when, ptxt)
 
 
-def pick_archive(conf, ref):
-    """An archive from a number of `eris backup list` or a file path."""
+def opt_value(args, name):
+    """--name VALUE (or --name=VALUE) from args, else None."""
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def positional(args, with_value=("--part", "--password-file", "--out", "--to", "--only")):
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a in with_value:
+            skip = True
+            continue
+        if not a.startswith("-"):
+            out.append(a)
+    return out
+
+
+def part_names(value):
+    import erisbackup as B
+    names = [x.strip() for x in (value or "").split(",") if x.strip()]
+    bad = [n for n in names if n not in B.PARTS]
+    if bad or not names:
+        raise ValueError("unknown part %s (parts: %s)" % (",".join(bad) or "''", ", ".join(B.PARTS)))
+    return names
+
+
+def selected_kinds(conf, args):
+    """[None (= the full backup) and/or part names] for eris backup now / list."""
+    if "--full" in args:
+        return [None]
+    if opt_value(args, "--part") is not None:
+        return part_names(opt_value(args, "--part"))
+    parts = E.parts_setting(conf["BACKUP_PARTS"])
+    if "--parts" in args:
+        return parts
+    return ([None] if conf["BACKUP_FULL"] == "on" else []) + parts
+
+
+def backup_one(conf, part, log):
+    """Make and check one backup (part None = the full one); the result goes to backup-state.json."""
+    import erisbackup as B
+    res = {"part": part or B.FULL, "ok": False}
+    full = part is None
+    saver = B.save_state if full else (lambda **kw: B.save_part_state(part, **kw))
+    if part and not B.present(part):
+        res.update(skipped=True, error="not on this server")
+        return res
+    try:
+        dest = B.folder(conf["BACKUP_DIR"], part, conf["BACKUP_OWNER"])
+        keep = int(conf["BACKUP_KEEP"] if full else conf["BACKUP_PART_KEEP"])
+        path = B.make(dest, keep, conf["BACKUP_OWNER"], log=log, part=part)
+    except Exception as e:
+        saver(last_error="%s" % e, last_error_epoch=int(time.time()), last_error_at=B.now_iso())
+        E.log("backup %s failed: %s" % (res["part"], e))
+        res["error"] = "%s" % e
+        return res
+    chk = B.check(path)
+    size = os.path.getsize(path)
+    res.update(path=path, size=size, sha256=B.stored_sha256(path), files=chk["files"], databases=chk["databases"],
+               message=chk["message"])
+    if not chk["ok"]:
+        saver(last_error="written but %s" % chk["message"], last_error_epoch=int(time.time()), last_error_at=B.now_iso())
+        res["error"] = "%s was written but %s" % (path, chk["message"])
+        return res
+    saver(last_ok=path, last_ok_epoch=int(time.time()), last_ok_at=B.now_iso(), last_size=size,
+          last_files=chk["files"], last_dbs=chk["databases"], last_sha256=res["sha256"],
+          last_error="", last_error_epoch=0)
+    E.log("backup %s %s (%s, %s)" % (res["part"], path, E.human(size), chk["message"]))
+    res["ok"] = True
+    return res
+
+
+def backup_now(conf, args):
+    import erisbackup as B
+    import json
+    quiet, as_json = "--quiet" in args, "--json" in args
+    if "--if-set" in args and not conf["BACKUP_DIR"]:
+        return 0
+    kinds = selected_kinds(conf, args)
+    out = (lambda *_: None) if (quiet or as_json) else print
+    results = []
+    if not kinds:
+        out("  nothing to back up (BACKUP_FULL=%s, BACKUP_PARTS=%s)" % (conf["BACKUP_FULL"], conf["BACKUP_PARTS"]))
+    else:
+        with B.lock():
+            if conf["BACKUP_DIR"] and os.path.isdir(conf["BACKUP_DIR"]):
+                B.migrate(conf["BACKUP_DIR"], conf["BACKUP_OWNER"], log=out)
+            for k in kinds:
+                out("  %s" % c(WHITE, "backup: %s" % (k or "full")))
+                r = backup_one(conf, k, out)
+                results.append(r)
+                if r.get("skipped"):
+                    out("  %s %s: %s" % (c(GREY, "skipped"), r["part"], r["error"]))
+                elif r["ok"]:
+                    out("  " + c(GREEN, "backup %s" % r["path"]) + "  %s, %s" % (E.human(r["size"]), r["message"]))
+                elif not as_json:
+                    print(c(RED, "eris backup %s: %s" % (r["part"], r["error"])))
+    ok = all(r["ok"] or r.get("skipped") for r in results)
+    if as_json:
+        print(json.dumps({"ok": ok, "results": results}, indent=1))
+    return 0 if ok else 1
+
+
+def backup_groups(conf, args):
+    """{"full" or part: [describe(archive)...]} for list/verify."""
+    import erisbackup as B
+    base = conf["BACKUP_DIR"]
+    if "--full" in args:
+        kinds = [None]
+    elif opt_value(args, "--part") is not None:
+        kinds = part_names(opt_value(args, "--part"))
+    else:
+        kinds = [None] + list(B.PARTS)
+    groups = {}
+    for k in kinds:
+        d = os.path.join(base, k or B.FULL) if base else ""
+        items = []
+        for i, (p, t) in enumerate(B.archives(d) if d else []):
+            item = B.describe(p, t)
+            item["n"] = i + 1
+            items.append(item)
+        groups[k or B.FULL] = items
+    return groups
+
+
+def backup_list(conf, args):
+    import json
+    groups = backup_groups(conf, args)
+    if "--json" in args:
+        print(json.dumps({"backup_dir": conf["BACKUP_DIR"], "keep": int(conf["BACKUP_KEEP"]),
+                          "part_keep": int(conf["BACKUP_PART_KEEP"]), "groups": groups}, indent=1))
+        return 0
+    if not conf["BACKUP_DIR"]:
+        print("no backup folder: eris set BACKUP_DIR /path/to/folder")
+        return 1
+    print("  %s (keep %s, each part %s, nightly at %s)" % (conf["BACKUP_DIR"], conf["BACKUP_KEEP"],
+                                                          conf["BACKUP_PART_KEEP"], conf["BACKUP_AT"]))
+    explicit = "--full" in args or opt_value(args, "--part") is not None
+    for name, items in groups.items():
+        if not items and name != "full" and not explicit:
+            continue
+        how = "eris restore N" if name == "full" else "eris restore --part %s N" % name
+        print("  " + c(WHITE, "%s" % name) + c(GREY, "   (%s)" % how))
+        for it in items:
+            print("  %s %s  %8s  %s" % (c(CYAN, "%2d)" % it["n"]), it["time"], E.human(it["size"]), it["name"]))
+        if not items:
+            print("     (none yet: eris backup now%s)" % ("" if name == "full" else " --part " + name))
+    return 0
+
+
+def backup_status(conf, args):
+    import erisbackup as B
+    import json
+    st = B.load_state()
+    pst = st.get("parts") or {}
+    wanted = E.parts_setting(conf["BACKUP_PARTS"])
+    timer = {"state": svc_state("eris-backup.timer"),
+             "next": sh("systemctl", "show", "-p", "NextElapseUSecRealtime", "--value",
+                        "eris-backup.timer").stdout.strip() or None}
+    base = conf["BACKUP_DIR"]
+    full = {k: v for k, v in st.items() if k != "parts"}
+    full.update(enabled=conf["BACKUP_FULL"] == "on", keep=int(conf["BACKUP_KEEP"]),
+                folder=os.path.join(base, B.FULL) if base else "",
+                count=len(B.archives(os.path.join(base, B.FULL))) if base else 0, failed=failed_state(st))
+    parts = {}
+    for name, info in B.PARTS.items():
+        p = dict(pst.get(name) or {})
+        p.update(title=info["title"], present=B.present(name), enabled=name in wanted,
+                 folder=os.path.join(base, name) if base else "",
+                 count=len(B.archives(os.path.join(base, name))) if base else 0, failed=failed_state(p))
+        parts[name] = p
+    if "--json" in args:
+        print(json.dumps({"backup_dir": base, "dir_ok": bool(base) and os.path.isdir(base), "at": conf["BACKUP_AT"],
+                          "part_keep": int(conf["BACKUP_PART_KEEP"]), "full": full, "parts": parts,
+                          "timer": timer, "eris": E.VERSION}, indent=1))
+        return 0
+    print("  " + backup_summary(conf))
+    for k in ("last_ok", "last_ok_at", "last_size", "last_error", "last_error_at"):
+        if full.get(k):
+            print("  %-14s %s" % (k, E.human(full[k]) if k == "last_size" else full[k]))
+    print("  " + c(WHITE, "parts") + "  (BACKUP_PARTS=%s, keep %s each)" % (conf["BACKUP_PARTS"], conf["BACKUP_PART_KEEP"]))
+    now = time.time()
+    for name, p in parts.items():
+        if not p["present"]:
+            state = c(GREY, "not on this server")
+        elif not p["enabled"]:
+            state = c(GREY, "not selected")
+        elif p["failed"]:
+            state = c(RED, "FAILED %s ago: %s" % (B.age_text(now - p["last_error_epoch"]), p.get("last_error", "")[:60]))
+        elif p.get("last_ok_epoch"):
+            state = c(GREEN, "ok") + " %s ago, %s" % (B.age_text(now - p["last_ok_epoch"]), E.human(p.get("last_size")))
+        else:
+            state = c(AMBER, "no backup yet")
+        print("    %-13s %s  (%d kept)" % (name, state, p["count"]))
+    print("  timer: %s, next: %s" % (timer["state"], timer["next"] or "?"))
+    return 0
+
+
+def backup_parts(args):
+    import erisbackup as B
+    import json
+    rows = [{"name": n, "title": p["title"], "present": B.present(n), "paths": p["paths"], "databases": p["databases"]}
+            for n, p in B.PARTS.items()]
+    if "--json" in args:
+        print(json.dumps(rows, indent=1))
+        return 0
+    for r in rows:
+        print("  %-13s %s %s" % (r["name"], c(GREEN, "here   ") if r["present"] else c(GREY, "missing"), r["title"]))
+        print("  %13s %s" % ("", " ".join(r["paths"] + r["databases"])))
+    return 0
+
+
+def backup_crypt(args, decrypt):
+    import erisbackup as B
+    pw = opt_value(args, "--password-file")
+    files = positional(args)
+    if not pw or len(files) != 1:
+        raise ValueError("usage: eris backup %s FILE --password-file F [--out OUT]" % ("decrypt" if decrypt else "encrypt"))
+    fn = B.decrypt if decrypt else B.encrypt
+    out = fn(files[0], pw, opt_value(args, "--out"))
+    print(out)
+    return 0
+
+
+def pick_archive(conf, ref, part=None):
+    """An archive from a number of `eris backup list` (in the full folder or a part's) or a file path."""
     import erisbackup as B
     if ref and os.path.isfile(ref):
         return ref
-    lst = B.archives(conf["BACKUP_DIR"])
+    base = conf["BACKUP_DIR"]
+    lst = B.archives(os.path.join(base, part or B.FULL)) if base else []
     if ref and ref.isdigit() and 1 <= int(ref) <= len(lst):
         return lst[int(ref) - 1][0]
-    raise ValueError("no backup %r (see: eris backup list)" % ref)
+    raise ValueError("no backup %r%s (see: eris backup list%s)" % (
+        ref, " of %s" % part if part else "", " --part " + part if part else ""))
 
 
 def cmd_backup(args):
     need_root()
     import erisbackup as B
+    import json
     conf = E.load_conf()
-    sub = args[0] if args else "now"
-    quiet = "--quiet" in args
-    if sub in ("now", "run", "--quiet"):
-        if "--if-set" in args and not conf["BACKUP_DIR"]:
-            return 0
-        try:
-            path = B.make(conf["BACKUP_DIR"], int(conf["BACKUP_KEEP"]), conf["BACKUP_OWNER"],
-                          log=(lambda *_: None) if quiet else print)
-        except Exception as e:
-            B.save_state(last_error="%s" % e, last_error_epoch=int(time.time()), last_error_at=B.now_iso())
-            E.log("backup failed: %s" % e)
-            print(c(RED, "eris backup: %s" % e))
-            return 1
-        ok, msg = B.verify(path)
-        size = os.path.getsize(path)
-        if not ok:
-            B.save_state(last_error="written but %s" % msg, last_error_epoch=int(time.time()), last_error_at=B.now_iso())
-            print(c(RED, "eris backup: %s was written but %s" % (path, msg)))
-            return 1
-        B.save_state(last_ok=path, last_ok_epoch=int(time.time()), last_ok_at=B.now_iso(), last_size=size,
-                     last_error="", last_error_epoch=0)
-        E.log("backup %s (%s, %s)" % (path, E.human(size), msg))
-        if not quiet:
-            print("  " + c(GREEN, "backup %s" % path) + "  %s, %s" % (E.human(size), msg))
-        return 0
+    sub = args[0] if args and not args[0].startswith("-") else "now"
+    rest = args[1:] if args and not args[0].startswith("-") else args
+    if sub in ("now", "run"):
+        return backup_now(conf, rest)
     if sub in ("list", "ls"):
-        lst = B.archives(conf["BACKUP_DIR"])
-        if not conf["BACKUP_DIR"]:
-            print("no backup folder: eris set BACKUP_DIR /path/to/folder")
-            return 1
-        print("  %s (keep %s, nightly at %s)" % (conf["BACKUP_DIR"], conf["BACKUP_KEEP"], conf["BACKUP_AT"]))
-        for i, (p, t) in enumerate(lst):
-            print("  %s %s  %8s  %s" % (c(CYAN, "%2d)" % (i + 1)), time.strftime("%Y-%m-%d %H:%M", time.localtime(t)),
-                                        E.human(os.path.getsize(p)), os.path.basename(p)))
-        if not lst:
-            print("  (no backups yet: eris backup)")
-        return 0
+        if conf["BACKUP_DIR"] and os.path.isdir(conf["BACKUP_DIR"]):
+            B.migrate(conf["BACKUP_DIR"], conf["BACKUP_OWNER"], log=lambda *_: None)
+        return backup_list(conf, rest)
     if sub == "status":
-        print("  " + backup_summary(conf))
-        st = B.load_state()
-        for k in ("last_ok", "last_ok_at", "last_size", "last_error", "last_error_at"):
-            if st.get(k):
-                print("  %-14s %s" % (k, E.human(st[k]) if k == "last_size" else st[k]))
-        print("  timer: %s, next: %s" % (svc_state("eris-backup.timer"),
-                                          sh("systemctl", "show", "-p", "NextElapseUSecRealtime", "--value",
-                                             "eris-backup.timer").stdout.strip() or "?"))
-        return 0
+        return backup_status(conf, rest)
+    if sub == "parts":
+        return backup_parts(rest)
     if sub == "verify":
-        path = pick_archive(conf, args[1] if len(args) > 1 else "1")
-        ok, msg = B.verify(path)
-        print("  %s: %s" % (os.path.basename(path), c(GREEN, "ok, " + msg) if ok else c(RED, msg)))
-        return 0 if ok else 1
-    print("usage: eris backup [now|list|status|verify N]")
-    return 2
+        part = None if "--full" in rest else opt_value(rest, "--part")
+        if part:
+            part = part_names(part)[0]
+        refs = positional(rest)
+        path = pick_archive(conf, refs[0] if refs else "1", part)
+        r = B.check(path)
+        if "--json" in rest:
+            print(json.dumps(dict(r, path=path, sha256=B.stored_sha256(path), size=os.path.getsize(path)), indent=1))
+        else:
+            print("  %s: %s" % (os.path.basename(path), c(GREEN, "ok, " + r["message"]) if r["ok"] else c(RED, r["message"])))
+        return 0 if r["ok"] else 1
+    if sub in ("encrypt", "decrypt"):
+        return backup_crypt(rest, sub == "decrypt")
+    print(BACKUP_USAGE)
+    return 0 if sub in ("help", "-h", "--help") else 2
 
 
 def cmd_restore(args):
     need_root()
     import erisbackup as B
     conf = E.load_conf()
-    to, only, yes, ref = "/", [], False, None
+    to, only, yes, ref, part = E.R("/") or "/", [], False, None, None
     i = 0
     while i < len(args):
         a = args[i]
@@ -6396,69 +6935,96 @@ def cmd_restore(args):
         elif a == "--only" and i + 1 < len(args):
             only.append(args[i + 1])
             i += 1
+        elif a == "--part" and i + 1 < len(args):
+            part, i = part_names(args[i + 1])[0], i + 1
         elif a in ("--yes", "-y"):
             yes = True
         elif a in ("-h", "--help"):
-            print("eris restore N|FILE [--to DIR] [--only PATH ...] [--yes]\n"
-                  "  N from 'eris backup list' (1 = newest). --to DIR extracts there instead of /;\n"
+            print("eris restore [--part NAME] N|FILE [--to DIR] [--only PATH ...] [--yes]\n"
+                  "  N from 'eris backup list' (1 = newest; with --part NAME from that part's list).\n"
+                  "  --to DIR extracts there instead of /;\n"
                   "  --only restores just these paths (e.g. --only /etc/x-ui --only /var/lib/marzban).\n"
-                  "  Into /, a backup of the present state is made first, and the programs whose\n"
-                  "  databases come back (Marzban, x-ui, Jellyfin) are stopped and started again.")
+                  "  Into /, a backup of the present state is made first (of the same part), and the\n"
+                  "  programs whose databases come back (Marzban, x-ui, Jellyfin) are stopped and started again.")
             return 0
         else:
             ref = a
         i += 1
     if ref is None:
-        print("usage: eris restore N|FILE [--to DIR] [--only PATH ...] [--yes]   (eris backup list)")
+        print("usage: eris restore [--part NAME] N|FILE [--to DIR] [--only PATH ...] [--yes]   (eris backup list)")
         return 2
-    path = pick_archive(conf, ref)
+    path = pick_archive(conf, ref, part)
     m = B.manifest(path)
-    print("  %s: %s, %s, ERIS %s" % (os.path.basename(path), m["host"], m["time"], m["eris"]))
+    mpart = m.get("part") if m.get("part") in B.PARTS else None
+    print("  %s: %s, %s, ERIS %s%s" % (os.path.basename(path), m["host"], m["time"], m["eris"],
+                                       ", part " + mpart if mpart else ""))
     print("  into %s%s" % (to, (", only " + " ".join(only)) if only else ", everything"))
-    live = os.path.realpath(to) == "/"
+    live = os.path.realpath(to) == os.path.realpath(E.R("/") or "/")
     if live and not yes:
         a = ask("   overwrite the files on this server with the backup? type yes: ")
         if a != "yes":
             print("  nothing changed")
             return 1
-    if live and conf["BACKUP_DIR"] and os.path.isdir(conf["BACKUP_DIR"]):
-        try:
-            before = B.make(conf["BACKUP_DIR"], int(conf["BACKUP_KEEP"]) + 1, conf["BACKUP_OWNER"],
-                            label="before-restore", log=lambda *_: None)
-            print("  the present state is saved first: %s" % before)
-        except Exception as e:
-            print(c(RED, "  could not save the present state first (%s); nothing changed" % e))
-            return 1
-    os.makedirs(to, exist_ok=True)
-    n, dbs = B.restore(path, to, only, log=print)
+    with B.lock():
+        if live and conf["BACKUP_DIR"] and os.path.isdir(conf["BACKUP_DIR"]):
+            try:
+                dest = B.folder(conf["BACKUP_DIR"], mpart, conf["BACKUP_OWNER"])
+                keep = int(conf["BACKUP_PART_KEEP"] if mpart else conf["BACKUP_KEEP"]) + 1
+                before = B.make(dest, keep, conf["BACKUP_OWNER"], label="before-restore", log=lambda *_: None, part=mpart)
+                print("  the present state is saved first: %s" % before)
+            except Exception as e:
+                print(c(RED, "  could not save the present state first (%s); nothing changed" % e))
+                return 1
+        os.makedirs(to, exist_ok=True)
+        n, dbs = B.restore(path, to, only, log=print)
     E.log("restore %s into %s (%d files, %d databases)" % (path, to, n, dbs))
     print("  " + c(GREEN, "done: %d files, %d databases" % (n, dbs)))
     return 0
 
 
 def backup_menu(conf):
+    import erisbackup as B
     print("   " + backup_summary(conf))
-    print("   %s back up now  %s list  %s folder  %s time  %s keep  %s owner" % (
-        c(CYAN, "1)"), c(CYAN, "2)"), c(CYAN, "3)"), c(CYAN, "4)"), c(CYAN, "5)"), c(CYAN, "6)")))
+    print("   %s back up now (full + parts)  %s one part now  %s list  %s status of each part" % (
+        c(CYAN, "1)"), c(CYAN, "2)"), c(CYAN, "3)"), c(CYAN, "4)")))
+    print("   %s folder  %s time  %s keep (full)  %s keep (each part)  %s owner  %s parts to back up  %s full backup on/off" % (
+        c(CYAN, "5)"), c(CYAN, "6)"), c(CYAN, "7)"), c(CYAN, "8)"), c(CYAN, "9)"), c(CYAN, "10)"), c(CYAN, "11)")))
     a = ask("   backup: ")
     if a == "1":
         cmd_backup(["now"])
     elif a == "2":
-        cmd_backup(["list"])
+        names = [n for n in B.PARTS if B.present(n)]
+        v = choose("part", names, None) if names else None
+        if v:
+            cmd_backup(["now", "--part", v])
     elif a == "3":
+        cmd_backup(["list"])
+    elif a == "4":
+        cmd_backup(["status"])
+    elif a == "5":
         v = ask("   folder (empty = keep, '-' = off) [%s]: " % (conf["BACKUP_DIR"] or "off"))
         if v:
             return set_setting("BACKUP_DIR", "" if v == "-" else v)
-    elif a == "4":
+    elif a == "6":
         v = ask("   time HH:MM [%s]: " % conf["BACKUP_AT"])
         return set_setting("BACKUP_AT", v) if v else None
-    elif a == "5":
-        v = ask("   backups to keep [%s]: " % conf["BACKUP_KEEP"])
+    elif a == "7":
+        v = ask("   full backups to keep [%s]: " % conf["BACKUP_KEEP"])
         return set_setting("BACKUP_KEEP", v) if v else None
-    elif a == "6":
+    elif a == "8":
+        v = ask("   backups of each part to keep [%s]: " % conf["BACKUP_PART_KEEP"])
+        return set_setting("BACKUP_PART_KEEP", v) if v else None
+    elif a == "9":
         v = ask("   owner user (empty = keep, '-' = root) [%s]: " % (conf["BACKUP_OWNER"] or "root"))
         if v:
             return set_setting("BACKUP_OWNER", "" if v == "-" else v)
+    elif a == "10":
+        print("   parts: %s" % ", ".join("%s%s" % (n, "" if B.present(n) else " (not here)") for n in B.PARTS))
+        v = ask("   all, none or names separated by commas [%s]: " % conf["BACKUP_PARTS"])
+        return set_setting("BACKUP_PARTS", v.replace(" ", "")) if v else None
+    elif a == "11":
+        v = choose("full backup (BACKUP_DIR/full)", ["on", "off"], conf["BACKUP_FULL"])
+        return set_setting("BACKUP_FULL", v) if v else None
     return None
 
 
@@ -6556,7 +7122,8 @@ def cmd_selftest():
         print("  %s %s %s" % (c(GREEN, "PASS") if ok else c(RED, "FAIL"), name, detail))
 
     print(c(PINK, "ERIS") + " selftest")
-    for f in ("/usr/local/lib/eris/erislib.py", DAEMON, "/usr/local/lib/eris/erisfw.py", "/usr/local/bin/eris"):
+    for f in ("/usr/local/lib/eris/erislib.py", DAEMON, "/usr/local/lib/eris/erisfw.py",
+              "/usr/local/lib/eris/erisbackup.py", "/usr/local/bin/eris"):
         try:
             compile(open(f).read(), f, "exec")
             check("python syntax", True, f)
@@ -6574,6 +7141,8 @@ def cmd_selftest():
     check("backup timer active", svc_state("eris-backup.timer") == "active", "eris-backup.timer")
     if conf["BACKUP_DIR"]:
         check("backup folder exists", os.path.isdir(conf["BACKUP_DIR"]), conf["BACKUP_DIR"])
+    import erisbackup as B
+    check("backup parts listed in erislib", tuple(B.PARTS) == E.PART_NAMES, ", ".join(B.PARTS))
     check("look unit enabled", svc_enabled(LOOK_UNIT) == "enabled", LOOK_UNIT)
     import erisfw as F
     if os.path.isfile(F.FW_CONF):
@@ -6587,7 +7156,7 @@ def cmd_selftest():
               "table %s, unit %s" % ("loaded" if loaded else "not loaded", svc_state(F.UNIT)))
         check("firewall rollback helper", os.access(F.ROLLBACK, os.X_OK), F.ROLLBACK)
     # render the dashboard at many sizes / charsets: every row exactly as wide as the console
-    sys.path.insert(0, "/usr/local/lib/eris")
+    sys.path.insert(0, os.environ.get("ERIS_LIB", "/usr/local/lib/eris"))
     import erisd
     col = erisd.Collector(conf)
     deadline = time.time() + 20
@@ -6998,7 +7567,11 @@ open("/etc/systemd/system/eris-backup.timer", "w").write(B.timer_text(E.load_con
 systemctl daemon-reload
 systemctl enable --now eris-backup.timer > /dev/null 2>&1 || say "warning: eris-backup.timer did not start"
 if grep -q '^BACKUP_DIR="/' /etc/eris/eris.conf; then
-  say "backup: nightly at $(sed -n 's/^BACKUP_AT="\(.*\)"$/\1/p' /etc/eris/eris.conf) into $(sed -n 's/^BACKUP_DIR="\(.*\)"$/\1/p' /etc/eris/eris.conf)"
+  say "backup: nightly at $(sed -n 's/^BACKUP_AT="\(.*\)"$/\1/p' /etc/eris/eris.conf) into $(sed -n 's/^BACKUP_DIR="\(.*\)"$/\1/p' /etc/eris/eris.conf) (full/ and one folder per part)"
+  # 2.5: the archives of 2.4 move from BACKUP_DIR into BACKUP_DIR/full (once; nothing to do afterwards)
+  python3 -c 'import sys; sys.path.insert(0, "/usr/local/lib/eris"); import erislib as E, erisbackup as B
+c = E.load_conf(); B.migrate(c["BACKUP_DIR"], c["BACKUP_OWNER"], log=lambda m: print("[ERIS] backup:" + m))' \
+    || say "warning: the older backups were not moved into full/ (eris backup list does it later)"
 else
   say "backup: off until a folder is set (eris set BACKUP_DIR /path/to/folder)"
 fi

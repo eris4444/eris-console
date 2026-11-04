@@ -25,8 +25,10 @@ A neon look for the physical console (tty1) of a headless Debian server, plus an
   - Every change is checked with `nft -c`, backed up, and rolled back after 60 seconds unless you confirm it.
   - Localhost and SSH from the LAN always keep working. Only its own nftables table is touched, never Docker's.
 - **Backups (`eris backup`, nightly once a folder is set)**
-  - Settings and data of the server in one archive, with consistent copies of the live SQLite databases (Marzban, x-ui, Jellyfin).
-  - The newest `BACKUP_KEEP` archives are kept; `eris restore` puts one back (all of it, or only some paths).
+  - Settings and data of the server in one full archive, with consistent copies of the live SQLite databases (Marzban, x-ui, Jellyfin).
+  - Each part of the server (Marzban, x-ui, xray-site, Jellyfin, ERIS, Claude F Web, system) also gets an archive of its own, in a folder of its own.
+  - The newest `BACKUP_KEEP` full archives and `BACKUP_PART_KEEP` archives of each part are kept; `eris restore` puts one back (all of it, or only some paths).
+  - `--json` output for other tools (eris-bot), and `eris backup encrypt` for copies that leave the server.
 
 Everything is plain Python 3 and bash with no pip packages. The installer is one self-contained file.
 
@@ -61,8 +63,8 @@ eris font [list | set NAME|default | current]
 eris apply                re-apply the console look
 eris render [ROWSxCOLS] [utf8|safe|ascii]   print one dashboard frame here
 eris fw ...               the firewall (see below; eris fw help)
-eris backup [now|list|status|verify N]   a backup now, the list, the last result
-eris restore N|FILE [--to DIR] [--only PATH ...] [--yes]   put a backup back
+eris backup [now|list|status|verify|parts|encrypt|decrypt] ...   backups (see Backups below)
+eris restore [--part NAME] N|FILE [--to DIR] [--only PATH ...] [--yes]   put a backup back
 eris selftest             quick checks of the installed files
 eris update [--check]     install the latest release from this repository (settings stay)
 ```
@@ -82,19 +84,61 @@ Settings are in `/etc/eris/eris.conf`:
 | `ERIS_GLYPHS` | the extra font glyphs (mascot, weather icons, sparklines) |
 | `MARZBAN` | `auto` = Marzban panel when `/opt/marzban/.env` exists, `off` = hidden |
 | `ALERTS`, `ALERT_CPU_TEMP`, `ALERT_DISK_TEMP` | the alert bar on/off and its temperature limits (80 °C / 55 °C) |
-| `BACKUP_DIR`, `BACKUP_AT`, `BACKUP_KEEP`, `BACKUP_OWNER` | nightly backup folder (empty = off), time, how many to keep, owner of the files |
+| `BACKUP_DIR`, `BACKUP_AT`, `BACKUP_KEEP`, `BACKUP_OWNER` | nightly backup folder (empty = off), time, how many full backups to keep, owner of the files |
+| `BACKUP_FULL`, `BACKUP_PARTS`, `BACKUP_PART_KEEP` | the full backup on/off, the parts backed up one by one (`all`, `none` or e.g. `marzban,x-ui`), how many of each part to keep |
 
 ### Backups
-`eris set BACKUP_DIR /srv/disk2/backups` turns the nightly backup on (`eris-backup.timer`, at `BACKUP_AT`).
-- **An archive** (`<host>-backup-YYYYmmdd-HHMM.tar`, mode 600) holds:
-  - `files.tar.gz`: the settings and data folders that exist on the server, such as `/etc/eris`, `/var/lib/marzban`, `/opt/marzban*`, `/etc/x-ui`, `/etc/xray-site`, `/root/.acme.sh`, `/appdata`, `/config/jellyfin`, `/etc/openmediavault`, `/etc/systemd/system`; caches and logs are left out;
+`eris set BACKUP_DIR /srv/disk2/backups` turns the nightly backup on (`eris-backup.timer`, at `BACKUP_AT`). Each night it makes the full backup and one backup of every part:
+
+```
+BACKUP_DIR/
+  full/          <host>-backup-YYYYmmdd-HHMM.tar          the whole server; it stays on this disk
+  marzban/       <host>-marzban-backup-YYYYmmdd-HHMM.tar
+  x-ui/  xray-site/  jellyfin/  eris/  claude-f-web/  system/
+```
+
+| Part | Paths | Database |
+| --- | --- | --- |
+| `marzban` | `/var/lib/marzban`, `/opt/marzban`, `/opt/marzban-nodes`, `/var/lib/marzban-nodes` | `/var/lib/marzban/db.sqlite3` |
+| `x-ui` | `/etc/x-ui`, `/etc/systemd/system/x-ui.service` | `/etc/x-ui/x-ui.db` |
+| `xray-site` | `/etc/xray-site`, `/var/lib/xray-site`, `/usr/local/bin/xray-site`, `/usr/local/share/xray-site`, `/root/.acme.sh`, `/etc/haproxy`, `/etc/nginx` | |
+| `jellyfin` | `/config/jellyfin` (no cache, logs or transcodes), `/appdata/JellyFin` | `/config/jellyfin/data/data/jellyfin.db` |
+| `eris` | `/etc/eris`, `/var/lib/eris` | |
+| `claude-f-web` | `/etc/claude-f-web`, `/var/lib/claude-f-web` | |
+| `system` | `/etc/openmediavault`, `/etc/systemd/system`, `/etc/fstab`, `/etc/sysctl.d`, `/etc/modules-load.d`, `/root/.ssh/authorized_keys`, `/etc/docker/daemon.json` | |
+
+A part that is not on the server is skipped. The parts are one dictionary, `PARTS` in `src/erisbackup.py` (plus the name in `erislib.PART_NAMES`).
+
+- **An archive** (mode 600) holds:
+  - `files.tar.gz`: the folders that exist on the server, with full paths; caches and logs are left out;
   - `databases/`: copies made with SQLite's own backup, checked with `integrity_check`;
-  - `manifest.json` and `RESTORE.txt`.
+  - `manifest.json` (host, time, part, paths, databases) and `RESTORE.txt`.
 - **Checks:** a `.sha256` file is written next to each archive, and the archive is read back after writing.
-- **Restore:** `eris restore 1` puts the newest backup back:
-  - first it backs up the present state (`…-before-restore.tar`);
+- **Upgrade from 2.4:** archives that lie in `BACKUP_DIR` itself move into `BACKUP_DIR/full/` once.
+
+```
+eris backup now                       full backup (BACKUP_FULL) + every part in BACKUP_PARTS
+eris backup now --full | --parts | --part marzban,x-ui
+eris backup list [--full | --part x-ui]       numbered, newest first
+eris backup status                    the last result of the full backup and of each part
+eris backup verify [N|FILE] [--part X]
+eris backup parts                     the parts and whether they are on this server
+eris backup encrypt FILE --password-file F [--out OUT]     -> FILE.enc
+eris backup decrypt FILE.enc --password-file F [--out OUT]
+eris restore 1                        the newest full backup
+eris restore --part x-ui 2            the second newest backup of x-ui
+```
+
+`now`, `list`, `status`, `verify` and `parts` take `--json` (used by eris-bot). The last result is also in `/var/lib/eris/backup-state.json`: the keys at the top describe the full backup (as in 2.4), `parts` has one entry per part.
+
+- **Restore:** `eris restore 1` puts the newest full backup back; `eris restore --part x-ui 1` only the x-ui part:
+  - first it backs up the present state (`…-before-restore.tar`, in the same folder);
   - it stops Marzban, x-ui and Jellyfin while their databases come back, then starts them again;
   - `--to DIR` only unpacks into a folder, and `--only /etc/x-ui` restores just that path.
+- **Encryption:** `eris backup encrypt` uses `openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt` with the password read from a file (`-pass file:`), so it never shows in `ps`. By hand:
+  ```bash
+  openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in FILE.enc -out FILE.tar
+  ```
 - **Secrets:** an archive holds passwords and private keys. `BACKUP_OWNER` gives the files to one user, for example to read them over SMB.
 
 ### Marzban panel
@@ -158,5 +202,15 @@ This removes the files, services and shell blocks, and restores the original con
 `src/` holds the sources. `src/build.sh` assembles them into the single `install-eris.sh`:
 
 ```bash
-bash src/build.sh ./install-eris.sh
+bash src/build.sh "$PWD/install-eris.sh"
 ```
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v      # backups on a fake server tree (ERIS_ROOT)
+bash tests/ci-install.sh fresh                # real install in a debian:trixie container with systemd (Docker)
+bash tests/ci-install.sh upgrade              # 2.4.0 first, then this version
+```
+
+`ERIS_ROOT=/tmp/fake` moves every path of ERIS (settings, state, the backed-up folders) under `/tmp/fake`. GitHub Actions runs the build, `bash -n`, shellcheck, the unit tests and both install tests on every push; a `v*` tag makes the release.

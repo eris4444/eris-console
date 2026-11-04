@@ -798,13 +798,25 @@ def alerts(d, conf):
                 out.append((2, "node %s %s" % (n.get("name"), n.get("status"))))
     if conf.get("BACKUP_DIR"):
         b = d.get("backup") or {}
-        last = b.get("last_ok_epoch")
-        if b.get("last_error_epoch", 0) > (last or 0):
-            out.append((2, "backup failed"))
+        parts = {k: v for k, v in (b.get("parts") or {}).items()
+                 if isinstance(v, dict) and k in E.parts_setting(conf.get("BACKUP_PARTS", "all"))}
+        failed = False
+        if conf.get("BACKUP_FULL", "on") == "on":
+            last = b.get("last_ok_epoch")
+            failed = b.get("last_error_epoch", 0) > (last or 0)
+            if failed:
+                out.append((2, "backup failed"))
+        else:   # only parts: the age of the newest part backup
+            last = max([p.get("last_ok_epoch") or 0 for p in parts.values()] or [0]) or None
+        if failed:
+            pass
         elif not last:
             out.append((1, "no backup yet"))
         elif time.time() - last > 36 * 3600:
             out.append((1, "backup %dd old" % ((time.time() - last) // 86400 or 1)))
+        for name, p in sorted(parts.items()):
+            if p.get("last_error_epoch", 0) > (p.get("last_ok_epoch") or 0):
+                out.append((2, "backup %s failed" % name))
         if not os.path.isdir(conf["BACKUP_DIR"]):
             out.append((2, "backup folder missing"))
     return sorted(out, key=lambda x: -x[0])
